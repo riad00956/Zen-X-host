@@ -192,7 +192,8 @@ def welcome(message):
     expiry = user[2] if user[2] else "Not Activated"
     
     text = f"""
-🤖 **CYBER BOT HOSTING v3.0**
+🤖 **ZEN BOT HOST v3.0.1**
+dev: @zerox6t9
 ━━━━━━━━━━━━━━━━━━━━
 👤 **User:** @{username}
 🆔 **ID:** `{uid}`
@@ -1093,9 +1094,9 @@ def show_admin_stats(call):
 • Disk Usage: {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Info:**
-• Platform: Render.com
+• Platform: ULTIMATE FLOW 
 • Port: {Config.PORT}
-• Database: SQLite
+• Database: zenxq
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1428,7 +1429,7 @@ if __name__ == '__main__':
     print(f"""
 🤖 CYBER BOT HOSTING v3.0
 ━━━━━━━━━━━━━━━━━━━━
-🚀 Starting on Render.com
+🚀 Starting on Zen bot
 • Port: {Config.PORT}
 • Admin ID: {Config.ADMIN_ID}
 • Database: ✅
