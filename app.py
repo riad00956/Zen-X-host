@@ -17,8 +17,8 @@ from flask import Flask
 
 # ১. Configuration
 class Config:
-    TOKEN = '8144529389:AAHmMAKR3VS2lWOEQ3VQXLGU-nHXFm2yuXM'
-    ADMIN_ID = 6926993789
+    TOKEN = '8494225623:AAG_HRSHoBpt36bdeUvYJL4ONnh-2bf6BnY'
+    ADMIN_ID = 7832264582
     PROJECT_DIR = 'projects'
     DB_NAME = 'cyber_v2.db'
     PORT = 8080
