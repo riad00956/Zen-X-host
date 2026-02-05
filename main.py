@@ -960,9 +960,9 @@ def show_dashboard(call):
 • Disk: {disk_bar} {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 💻 **Hosting Platform:**
-• Platform: Render.com
-• Type: Web Service
-• Region: Global
+• Platform: ULTIMATE FLOW 
+• Type: Web Service 
+• Region: Asia/kushtia🇧🇩
 ━━━━━━━━━━━━━━━━━━━━
 """
     
