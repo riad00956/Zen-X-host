@@ -1,4 +1,3 @@
 pyTelegramBotAPI
-Flask
-Werkzeug
-gunicorn
+flask
+werkzeug
