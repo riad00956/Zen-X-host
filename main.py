@@ -17,8 +17,8 @@ from flask import Flask, render_template_string
 
 # ১. Configuration
 class Config:
-    TOKEN = os.environ.get('BOT_TOKEN', '8144529389:AAHmMAKR3VS2lWOEQ3VQXLGU-nHXFm2yuXM')
-    ADMIN_ID = int(os.environ.get('ADMIN_ID', 6926993789))
+    TOKEN = os.environ.get('BOT_TOKEN', '8494225623:AAG_HRSHoBpt36bdeUvYJL4ONnh-2bf6BnY')
+    ADMIN_ID = int(os.environ.get('ADMIN_ID', 7832264582))
     PROJECT_DIR = 'projects'
     DB_NAME = 'cyber_v2.db'
     PORT = int(os.environ.get('PORT', 10000))  # Render uses PORT environment variable
