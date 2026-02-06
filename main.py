@@ -9,19 +9,21 @@ import uuid
 import signal
 import random
 import platform
+import zipfile
+import json
 from pathlib import Path
 from telebot import types
 from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, send_file
 
 # ১. Configuration
 class Config:
-    TOKEN = os.environ.get('BOT_TOKEN', '8494225623:AAG_HRSHoBpt36bdeUvYJL4ONnh-2bf6BnY')
-    ADMIN_ID = int(os.environ.get('ADMIN_ID', 7832264582))
+    TOKEN = os.environ.get('BOT_TOKEN', '8144529389:AAHmMAKR3VS2lWOEQ3VQXLGU-nHXFm2yuXM')
+    ADMIN_ID = int(os.environ.get('ADMIN_ID', 6926993789))
     PROJECT_DIR = 'projects'
     DB_NAME = 'cyber_v2.db'
-    PORT = int(os.environ.get('PORT', 10000))  # Render uses PORT environment variable
+    PORT = int(os.environ.get('PORT', 10000))
     MAINTENANCE = False
 
 bot = telebot.TeleBot(Config.TOKEN)
@@ -34,45 +36,41 @@ def init_db():
     conn = sqlite3.connect(Config.DB_NAME)
     c = conn.cursor()
     
-    # Drop old tables if they exist
     c.execute("DROP TABLE IF EXISTS users")
     c.execute("DROP TABLE IF EXISTS keys")
     c.execute("DROP TABLE IF EXISTS deployments")
+    c.execute("DROP TABLE IF EXISTS backups")
     
-    # Create new tables with correct structure
     c.execute('''CREATE TABLE users 
                 (id INTEGER PRIMARY KEY, username TEXT, expiry TEXT, file_limit INTEGER, is_prime INTEGER, join_date TEXT)''')
     c.execute('''CREATE TABLE keys 
                 (key TEXT PRIMARY KEY, duration_days INTEGER, file_limit INTEGER, created_date TEXT)''')
     c.execute('''CREATE TABLE deployments 
                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, bot_name TEXT, filename TEXT, pid INTEGER, 
-                 start_time TEXT, status TEXT, cpu_usage REAL, ram_usage REAL)''')
+                 start_time TEXT, status TEXT, cpu_usage REAL, ram_usage REAL, api_key TEXT)''')
+    c.execute('''CREATE TABLE backups 
+                (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER, backup_name TEXT, backup_path TEXT, 
+                 created_date TEXT, size_kb REAL)''')
     
-    # Insert admin user
     join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     c.execute("INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?, ?, ?)", 
-             (Config.ADMIN_ID, 'admin', None, 10, 1, join_date))
+             (Config.ADMIN_ID, 'admin', None, 50, 1, join_date))
     
     conn.commit()
     conn.close()
 
-# Initialize database
 init_db()
 
-# System Monitoring Functions (without psutil)
+# System Monitoring Functions
 def get_system_stats():
-    """Get system statistics without psutil"""
-    stats = {
+    return {
         'cpu_percent': random.randint(20, 80),
         'ram_percent': random.randint(30, 70),
         'disk_percent': random.randint(40, 60)
     }
-    return stats
 
 def get_process_stats(pid):
-    """Get stats for a specific process without psutil"""
     try:
-        # Check if process is running
         os.kill(pid, 0)
         return True
     except:
@@ -88,7 +86,7 @@ def get_user(user_id):
 
 def is_prime(user_id):
     user = get_user(user_id)
-    if user and user[2]:  # expiry field
+    if user and user[2]:
         try:
             expiry = datetime.strptime(user[2], '%Y-%m-%d %H:%M:%S')
             return expiry > datetime.now()
@@ -99,7 +97,7 @@ def is_prime(user_id):
 def get_user_bots(user_id):
     conn = sqlite3.connect(Config.DB_NAME)
     c = conn.cursor()
-    bots = c.execute("SELECT id, bot_name, filename, pid, start_time, status FROM deployments WHERE user_id=?", 
+    bots = c.execute("SELECT id, bot_name, filename, pid, start_time, status, api_key FROM deployments WHERE user_id=?", 
                     (user_id,)).fetchall()
     conn.close()
     return bots
@@ -117,10 +115,58 @@ def generate_random_key():
     random_chars = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=8))
     return f"{prefix}{random_chars}"
 
+def generate_api_key():
+    return f"BOT-{uuid.uuid4().hex[:12].upper()}"
+
 def create_progress_bar(percentage):
-    """Create a graphical progress bar"""
     bars = int(percentage / 10)
     return "█" * bars + "░" * (10 - bars)
+
+def extract_zip(zip_path, extract_to):
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_to)
+    
+    # Find main python file
+    for root, dirs, files in os.walk(extract_to):
+        for file in files:
+            if file.endswith('.py'):
+                return file
+    return None
+
+def create_backup(bot_id, bot_name):
+    conn = sqlite3.connect(Config.DB_NAME)
+    c = conn.cursor()
+    
+    # Get bot files
+    bot_info = c.execute("SELECT filename FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    if not bot_info:
+        conn.close()
+        return None
+    
+    filename = bot_info[0]
+    backup_dir = Path('backups')
+    backup_dir.mkdir(exist_ok=True)
+    
+    # Create zip file
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_name = f"{bot_name}_{timestamp}.zip"
+    backup_path = backup_dir / backup_name
+    
+    with zipfile.ZipFile(backup_path, 'w') as zipf:
+        file_path = project_path / filename
+        if file_path.exists():
+            zipf.write(file_path, filename)
+    
+    # Save backup info to database
+    size_kb = os.path.getsize(backup_path) / 1024
+    created_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    c.execute("INSERT INTO backups (bot_id, backup_name, backup_path, created_date, size_kb) VALUES (?, ?, ?, ?, ?)",
+             (bot_id, backup_name, str(backup_path), created_date, size_kb))
+    conn.commit()
+    conn.close()
+    
+    return backup_path
 
 # Keyboards
 def main_menu(user_id):
@@ -129,6 +175,7 @@ def main_menu(user_id):
     user = get_user(user_id)
     if not is_prime(user_id):
         markup.add(types.InlineKeyboardButton("🔑 Activate Prime Pass", callback_data="activate_prime"))
+        markup.add(types.InlineKeyboardButton("💎 Get Prime Pass", url="https://t.me/zerox6t9"))
         markup.add(types.InlineKeyboardButton("ℹ️ Premium Features", callback_data="premium_info"))
     else:
         markup.add(
@@ -154,8 +201,12 @@ def admin_menu():
         types.InlineKeyboardButton("👥 All Users", callback_data="all_users")
     )
     markup.add(
-        types.InlineKeyboardButton("🤖 All Bots", callback_data="all_bots"),
-        types.InlineKeyboardButton("📈 Statistics", callback_data="stats")
+        types.InlineKeyboardButton("🤖 All Bots", callback_data="all_bots_admin"),
+        types.InlineKeyboardButton("📊 Statistics", callback_data="stats")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🗃️ Database View", callback_data="db_view"),
+        types.InlineKeyboardButton("💾 Backup System", callback_data="backup_system")
     )
     markup.add(
         types.InlineKeyboardButton("⚙️ Maintenance", callback_data="maintenance"),
@@ -192,8 +243,7 @@ def welcome(message):
     expiry = user[2] if user[2] else "Not Activated"
     
     text = f"""
-🤖 **ZEN BOT HOST v3.0.1**
-dev: @zerox6t9
+🤖 **CYBER BOT HOSTING v4.0**
 ━━━━━━━━━━━━━━━━━━━━
 👤 **User:** @{username}
 🆔 **ID:** `{uid}`
@@ -255,9 +305,9 @@ Format: `PRIME-XXXXXX`
             msg = bot.edit_message_text("""
 📤 **UPLOAD BOT FILE**
 ━━━━━━━━━━━━━━━━━━━━
-Please send your Python (.py) bot file.
-• Max size: 5MB
-• Must be .py extension
+Please send your Python (.py) or ZIP (.zip) file.
+• Max size: 10MB
+• Allowed: .py, .zip
 ━━━━━━━━━━━━━━━━━━━━
             """, chat_id, mid, parse_mode="Markdown")
             bot.register_next_step_handler(msg, upload_file_step, mid)
@@ -288,19 +338,32 @@ Please send your Python (.py) bot file.
                 
         elif call.data == "all_users":
             if uid == Config.ADMIN_ID:
-                show_all_users(call)
+                show_all_users_paged(call, page=1)
                 
-        elif call.data == "all_bots":
+        elif call.data == "all_bots_admin":
             if uid == Config.ADMIN_ID:
-                show_all_bots_admin(call)
+                show_all_bots_admin_paged(call, page=1)
                 
         elif call.data == "stats":
             if uid == Config.ADMIN_ID:
                 show_admin_stats(call)
                 
+        elif call.data == "db_view":
+            if uid == Config.ADMIN_ID:
+                show_database_view(call)
+                
+        elif call.data == "backup_system":
+            if uid == Config.ADMIN_ID:
+                show_backup_system(call)
+                
         elif call.data.startswith("bot_"):
-            bot_id = call.data.split("_")[1]
-            show_bot_details(call, bot_id)
+            parts = call.data.split("_")
+            if len(parts) == 2:
+                bot_id = parts[1]
+                show_bot_details(call, bot_id)
+            elif len(parts) == 3 and parts[1] == "page":
+                page = int(parts[2])
+                show_my_bots_paged(call, page)
             
         elif call.data.startswith("deploy_"):
             filename = call.data.split("_")[1]
@@ -310,7 +373,19 @@ Please send your Python (.py) bot file.
             bot_id = call.data.split("_")[1]
             stop_bot(call, bot_id)
             
-        elif call.data == "install_libs":
+        elif call.data.startswith("delete_"):
+            bot_id = call.data.split("_")[1]
+            ask_delete_verification(call, bot_id)
+            
+        elif call.data.startswith("confirm_delete_"):
+            bot_id = call.data.split("_")[2]
+            confirm_delete_bot(call, bot_id)
+            
+        elif call.data.startswith("export_"):
+            bot_id = call.data.split("_")[1]
+            export_bot_files(call, bot_id)
+            
+        elif call.data.startswith("install_libs"):
             ask_for_libraries(call)
             
         elif call.data == "back_main":
@@ -325,6 +400,21 @@ Please send your Python (.py) bot file.
             
         elif call.data == "maintenance":
             toggle_maintenance(call)
+            
+        elif call.data.startswith("user_page_"):
+            page = int(call.data.split("_")[2])
+            show_all_users_paged(call, page)
+            
+        elif call.data.startswith("admin_bot_page_"):
+            page = int(call.data.split("_")[3])
+            show_all_bots_admin_paged(call, page)
+            
+        elif call.data.startswith("export_db"):
+            export_database(call)
+            
+        elif call.data.startswith("view_backup_"):
+            backup_id = call.data.split("_")[2]
+            view_backup_details(call, backup_id)
             
     except Exception as e:
         print(f"Callback error: {e}")
@@ -367,11 +457,9 @@ def gen_key_step3(message, days):
             raise ValueError
         bot.delete_message(message.chat.id, message.message_id)
         
-        # Generate key
         key = generate_random_key()
         created_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        # Save to database
         conn = sqlite3.connect(Config.DB_NAME)
         c = conn.cursor()
         c.execute("INSERT INTO keys VALUES (?, ?, ?, ?)", 
@@ -379,7 +467,6 @@ def gen_key_step3(message, days):
         conn.commit()
         conn.close()
         
-        # Send key
         response = f"""
 ✅ **KEY GENERATED SUCCESSFULLY**
 ━━━━━━━━━━━━━━━━━━━━
@@ -404,21 +491,49 @@ def upload_file_step(message, old_mid):
                              chat_id, old_mid, reply_markup=main_menu(uid))
         return
     
-    if message.content_type == 'document' and message.document.file_name.endswith('.py'):
+    if message.content_type == 'document':
+        file_name = message.document.file_name
+        if not (file_name.endswith('.py') or file_name.endswith('.zip')):
+            bot.edit_message_text("❌ **Invalid File!**\n\nOnly Python (.py) or ZIP (.zip) files allowed.", 
+                                 chat_id, old_mid)
+            return
+            
         try:
             bot.edit_message_text("📥 **Downloading file...**", chat_id, old_mid)
             
-            # Download file
             file_info = bot.get_file(message.document.file_id)
             downloaded = bot.download_file(file_info.file_path)
             original_name = message.document.file_name
             safe_name = secure_filename(original_name)
             
-            # Save file
             file_path = project_path / safe_name
             file_path.write_bytes(downloaded)
             
-            # Get bot name from user
+            # Handle ZIP file
+            if safe_name.endswith('.zip'):
+                extract_dir = project_path / f"extracted_{uid}_{int(time.time())}"
+                extract_dir.mkdir(exist_ok=True)
+                
+                main_file = extract_zip(file_path, extract_dir)
+                if not main_file:
+                    bot.edit_message_text("❌ **No Python file found in ZIP!**", chat_id, old_mid)
+                    return
+                
+                # Move main file to project directory
+                main_file_path = extract_dir / main_file
+                new_safe_name = secure_filename(main_file)
+                final_path = project_path / new_safe_name
+                main_file_path.rename(final_path)
+                
+                # Cleanup
+                for item in extract_dir.iterdir():
+                    if item.is_file():
+                        item.unlink()
+                extract_dir.rmdir()
+                file_path.unlink()  # Remove original zip
+                
+                safe_name = new_safe_name
+            
             bot.delete_message(chat_id, message.message_id)
             msg = bot.send_message(chat_id, """
 🤖 **BOT NAME SETUP**
@@ -432,25 +547,25 @@ Example: `News Bot`, `Music Bot`, `Assistant`
         except Exception as e:
             bot.edit_message_text(f"❌ **Error:** {str(e)}", chat_id, old_mid)
     else:
-        bot.edit_message_text("❌ **Invalid File!**\n\nOnly Python (.py) files allowed.", 
-                             chat_id, old_mid)
+        bot.edit_message_text("❌ **Please send a file!**", chat_id, old_mid)
 
 def save_bot_name(message, safe_name, original_name):
     uid = message.from_user.id
     chat_id = message.chat.id
     bot_name = message.text.strip()
     
-    # Save to database
+    # Generate API key for the bot
+    api_key = generate_api_key()
+    
     conn = sqlite3.connect(Config.DB_NAME)
     c = conn.cursor()
-    c.execute("INSERT INTO deployments (user_id, bot_name, filename, pid, start_time, status) VALUES (?, ?, ?, ?, ?, ?)",
-             (uid, bot_name, safe_name, 0, None, "Uploaded"))
+    c.execute("INSERT INTO deployments (user_id, bot_name, filename, pid, start_time, status, api_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (uid, bot_name, safe_name, 0, None, "Uploaded", api_key))
     conn.commit()
     conn.close()
     
     bot.delete_message(chat_id, message.message_id)
     
-    # Ask for libraries
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("📚 Install Libraries", callback_data="install_libs"))
     markup.add(types.InlineKeyboardButton("🤖 My Bots", callback_data="my_bots"))
@@ -461,6 +576,7 @@ def save_bot_name(message, safe_name, original_name):
 ━━━━━━━━━━━━━━━━━━━━
 🤖 **Bot Name:** {bot_name}
 📁 **File:** `{original_name}`
+🔑 **API Key:** `{api_key}`
 📊 **Status:** Ready for setup
 ━━━━━━━━━━━━━━━━━━━━
 Click 'Install Libraries' to add dependencies.
@@ -492,7 +608,6 @@ def install_libraries_step(message, old_mid):
     
     bot.delete_message(chat_id, message.message_id)
     
-    # Show installing progress
     bot.edit_message_text("""
 🛠 **INSTALLING LIBRARIES**
 ━━━━━━━━━━━━━━━━━━━━
@@ -504,7 +619,6 @@ Starting installation...
     for i, cmd in enumerate(commands):
         if cmd.strip() and "pip install" in cmd:
             try:
-                # Update progress
                 progress_text = f"""
 🛠 **INSTALLING LIBRARIES**
 ━━━━━━━━━━━━━━━━━━━━
@@ -514,7 +628,6 @@ Installing ({i+1}/{len(commands)}):
                 """
                 bot.edit_message_text(progress_text, chat_id, old_mid, parse_mode="Markdown")
                 
-                # Run installation
                 result = subprocess.run(cmd.split(), capture_output=True, text=True, timeout=60)
                 if result.returncode == 0:
                     results.append(f"✅ {cmd}")
@@ -528,7 +641,6 @@ Installing ({i+1}/{len(commands)}):
             except Exception as e:
                 results.append(f"⚠️ {cmd} (Error)")
     
-    # Show results
     result_text = "\n".join(results)
     final_text = f"""
 ✅ **INSTALLATION COMPLETE**
@@ -577,7 +689,6 @@ def start_deployment(call, filename):
     chat_id = call.message.chat.id
     mid = call.message.message_id
     
-    # Get bot details
     conn = sqlite3.connect(Config.DB_NAME)
     c = conn.cursor()
     bot_info = c.execute("SELECT id, bot_name FROM deployments WHERE filename=? AND user_id=?", 
@@ -589,69 +700,34 @@ def start_deployment(call, filename):
     
     bot_id, bot_name = bot_info
     
-    # Step 1: Initializing
-    text = f"""
-🚀 **DEPLOYING BOT**
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot:** {bot_name}
-🔄 **Status:** Initializing system...
-━━━━━━━━━━━━━━━━━━━━
-    """
-    bot.edit_message_text(text, chat_id, mid, parse_mode="Markdown")
-    time.sleep(1.5)
+    steps = [
+        "Initializing system...",
+        "Checking dependencies...",
+        "Loading modules...",
+        "Starting bot process..."
+    ]
     
-    # Step 2: Checking dependencies
-    text = f"""
+    for i, step in enumerate(steps):
+        step_text = "\n".join([f"✅ **Step {j+1}:** {steps[j]}" for j in range(i)] + [f"🔄 **Step {i+1}:** {step}"])
+        text = f"""
 🚀 **DEPLOYING BOT**
 ━━━━━━━━━━━━━━━━━━━━
 🤖 **Bot:** {bot_name}
-✅ **Step 1:** System initialized
-🔄 **Step 2:** Checking dependencies...
+{step_text}
 ━━━━━━━━━━━━━━━━━━━━
-    """
-    bot.edit_message_text(text, chat_id, mid, parse_mode="Markdown")
-    time.sleep(1.5)
-    
-    # Step 3: Loading modules
-    text = f"""
-🚀 **DEPLOYING BOT**
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot:** {bot_name}
-✅ **Step 1:** System initialized
-✅ **Step 2:** Dependencies checked
-🔄 **Step 3:** Loading modules...
-━━━━━━━━━━━━━━━━━━━━
-    """
-    bot.edit_message_text(text, chat_id, mid, parse_mode="Markdown")
-    time.sleep(2)
-    
-    # Step 4: Starting bot
-    text = f"""
-🚀 **DEPLOYING BOT**
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot:** {bot_name}
-✅ **Step 1:** System initialized
-✅ **Step 2:** Dependencies checked
-✅ **Step 3:** Modules loaded
-🔄 **Step 4:** Starting bot process...
-━━━━━━━━━━━━━━━━━━━━
-    """
-    bot.edit_message_text(text, chat_id, mid, parse_mode="Markdown")
-    time.sleep(1.5)
+        """
+        bot.edit_message_text(text, chat_id, mid, parse_mode="Markdown")
+        time.sleep(1.5)
     
     try:
-        # Actually start the bot
         file_path = project_path / filename
         start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        # Use nohup to keep process running in background on Render
-        proc = subprocess.Popen(['nohup', 'python', str(file_path), '&'], 
+        proc = subprocess.Popen(['python', str(file_path)], 
                                stdout=subprocess.PIPE, 
                                stderr=subprocess.PIPE,
-                               shell=False,
-                               preexec_fn=os.setsid)
+                               start_new_session=True)
         
-        # Update database
         conn = sqlite3.connect(Config.DB_NAME)
         c = conn.cursor()
         c.execute("UPDATE deployments SET pid=?, start_time=?, status=? WHERE id=?", 
@@ -659,7 +735,6 @@ def start_deployment(call, filename):
         conn.commit()
         conn.close()
         
-        # Success message
         text = f"""
 ✅ **BOT DEPLOYED SUCCESSFULLY**
 ━━━━━━━━━━━━━━━━━━━━
@@ -674,7 +749,6 @@ Bot is now active and running!
         bot.edit_message_text(text, chat_id, mid, parse_mode="Markdown")
         time.sleep(2)
         
-        # Show live stats
         show_bot_live_stats(call, bot_id, bot_name, proc.pid)
         
     except Exception as e:
@@ -691,29 +765,23 @@ def show_bot_live_stats(call, bot_id, bot_name, pid):
     chat_id = call.message.chat.id
     uid = call.from_user.id
     
-    # Create monitoring thread
     def monitor_bot():
-        for i in range(10):  # Show 10 updates
+        for i in range(10):
             try:
-                # Get system stats
                 stats = get_system_stats()
                 cpu_percent = stats['cpu_percent']
                 ram_percent = stats['ram_percent']
                 disk_percent = stats['disk_percent']
                 
-                # Update in database
                 update_bot_stats(bot_id, cpu_percent, ram_percent)
                 
-                # Create progress bars
                 cpu_bar = create_progress_bar(cpu_percent)
                 ram_bar = create_progress_bar(ram_percent)
                 disk_bar = create_progress_bar(disk_percent)
                 
-                # Check if process is still running
                 is_running = get_process_stats(pid)
                 status_icon = "🟢" if is_running else "🔴"
                 
-                # Show live stats
                 text = f"""
 📊 **LIVE BOT STATISTICS** {status_icon}
 ━━━━━━━━━━━━━━━━━━━━
@@ -734,7 +802,6 @@ def show_bot_live_stats(call, bot_id, bot_name, pid):
 🔄 **Status:** {"Running smoothly..." if is_running else "Process stopped"}
                 """
                 
-                # Edit message with new stats
                 try:
                     bot.edit_message_text(text, chat_id, call.message.message_id, 
                                          parse_mode="Markdown")
@@ -747,12 +814,10 @@ def show_bot_live_stats(call, bot_id, bot_name, pid):
                 print(f"Monitor error: {e}")
                 break
     
-    # Start monitoring in background
     monitor_thread = threading.Thread(target=monitor_bot)
     monitor_thread.daemon = True
     monitor_thread.start()
     
-    # Show final message
     time.sleep(5)
     text = f"""
 ✅ **BOT IS NOW ACTIVE**
@@ -773,6 +838,9 @@ Live statistics will update every 5 seconds.
                          reply_markup=markup, parse_mode="Markdown")
 
 def show_my_bots(call):
+    show_my_bots_paged(call, page=1)
+
+def show_my_bots_paged(call, page=1):
     uid = call.from_user.id
     bots = get_user_bots(uid)
     
@@ -791,11 +859,29 @@ No bots found. Upload your first bot!
                              reply_markup=markup, parse_mode="Markdown")
         return
     
+    items_per_page = 5
+    total_pages = (len(bots) + items_per_page - 1) // items_per_page
+    page = max(1, min(page, total_pages))
+    
+    start_idx = (page - 1) * items_per_page
+    end_idx = start_idx + items_per_page
+    page_bots = bots[start_idx:end_idx]
+    
     markup = types.InlineKeyboardMarkup(row_width=1)
-    for bot_id, bot_name, filename, pid, start_time, status in bots:
+    for bot_id, bot_name, filename, pid, start_time, status, api_key in page_bots:
         status_icon = "🟢" if status == "Running" else "🔴" if status == "Stopped" else "🟡"
         button_text = f"{status_icon} {bot_name}"
         markup.add(types.InlineKeyboardButton(button_text, callback_data=f"bot_{bot_id}"))
+    
+    # Pagination buttons
+    pagination_buttons = []
+    if page > 1:
+        pagination_buttons.append(types.InlineKeyboardButton("◀️ Previous", callback_data=f"bot_page_{page-1}"))
+    if page < total_pages:
+        pagination_buttons.append(types.InlineKeyboardButton("Next ▶️", callback_data=f"bot_page_{page+1}"))
+    
+    if pagination_buttons:
+        markup.add(*pagination_buttons)
     
     markup.add(types.InlineKeyboardButton("📤 Upload New", callback_data="upload"))
     markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
@@ -804,7 +890,7 @@ No bots found. Upload your first bot!
     total_count = len(bots)
     
     text = f"""
-🤖 **MY BOTS**
+🤖 **MY BOTS** (Page {page}/{total_pages})
 ━━━━━━━━━━━━━━━━━━━━
 📊 **Stats:** {running_count}/{total_count} running
 ━━━━━━━━━━━━━━━━━━━━
@@ -824,7 +910,6 @@ def show_bot_details(call, bot_id):
     if not bot_info:
         return
     
-    # Safe unpacking
     bot_name = bot_info[2] if len(bot_info) > 2 else "Unknown"
     filename = bot_info[3] if len(bot_info) > 3 else "Unknown"
     pid = bot_info[4] if len(bot_info) > 4 else 0
@@ -832,8 +917,8 @@ def show_bot_details(call, bot_id):
     status = bot_info[6] if len(bot_info) > 6 else "Unknown"
     cpu_usage = bot_info[7] if len(bot_info) > 7 else 0
     ram_usage = bot_info[8] if len(bot_info) > 8 else 0
+    api_key = bot_info[9] if len(bot_info) > 9 else "N/A"
     
-    # Get current stats
     stats = get_system_stats()
     cpu_usage = cpu_usage or stats['cpu_percent']
     ram_usage = ram_usage or stats['ram_percent']
@@ -841,7 +926,6 @@ def show_bot_details(call, bot_id):
     cpu_bar = create_progress_bar(cpu_usage)
     ram_bar = create_progress_bar(ram_usage)
     
-    # Check if process is running
     is_running = get_process_stats(pid) if pid else False
     
     stats_text = f"""
@@ -850,6 +934,7 @@ def show_bot_details(call, bot_id):
 • RAM: {ram_bar} {ram_usage:.1f}%
 • Status: {"🟢 Running" if is_running else "🔴 Stopped"}
 • Uptime: {calculate_uptime(start_time) if start_time else "N/A"}
+• API Key: `{api_key}`
     """
     
     text = f"""
@@ -864,19 +949,147 @@ def show_bot_details(call, bot_id):
 ━━━━━━━━━━━━━━━━━━━━
     """
     
-    markup = types.InlineKeyboardMarkup()
+    markup = types.InlineKeyboardMarkup(row_width=2)
     if is_running:
         markup.add(types.InlineKeyboardButton("🛑 Stop Bot", callback_data=f"stop_{bot_id}"))
-    elif pid:
-        markup.add(types.InlineKeyboardButton("🚀 Start Bot", callback_data=f"start_{bot_id}"))
     else:
-        markup.add(types.InlineKeyboardButton("🚀 Deploy Bot", callback_data=f"deploy_{filename}"))
+        markup.add(types.InlineKeyboardButton("🚀 Start Bot", callback_data=f"start_{bot_id}"))
     
+    markup.add(types.InlineKeyboardButton("🗑️ Delete Bot", callback_data=f"delete_{bot_id}"),
+               types.InlineKeyboardButton("📦 Export Bot", callback_data=f"export_{bot_id}"))
     markup.add(types.InlineKeyboardButton("📊 Refresh Stats", callback_data=f"bot_{bot_id}"))
     markup.add(types.InlineKeyboardButton("🔙 My Bots", callback_data="my_bots"))
     
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
                          reply_markup=markup, parse_mode="Markdown")
+
+def ask_delete_verification(call, bot_id):
+    conn = sqlite3.connect(Config.DB_NAME)
+    c = conn.cursor()
+    bot_info = c.execute("SELECT bot_name, api_key FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    conn.close()
+    
+    if not bot_info:
+        return
+    
+    bot_name, api_key = bot_info
+    
+    text = f"""
+⚠️ **DELETE VERIFICATION**
+━━━━━━━━━━━━━━━━━━━━
+You are about to delete bot: **{bot_name}**
+
+For verification, please enter:
+1. Bot API Key: `{api_key}`
+OR
+2. Bot Username
+
+Type exactly as shown above to confirm deletion.
+━━━━━━━━━━━━━━━━━━━━
+    """
+    
+    msg = bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+    bot.register_next_step_handler(msg, verify_delete_bot, bot_id, bot_name, api_key)
+
+def verify_delete_bot(message, bot_id, bot_name, api_key):
+    user_input = message.text.strip()
+    
+    if user_input == api_key or user_input == bot_name:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("✅ Confirm Delete", callback_data=f"confirm_delete_{bot_id}"),
+            types.InlineKeyboardButton("❌ Cancel", callback_data=f"bot_{bot_id}")
+        )
+        
+        text = f"""
+⚠️ **FINAL CONFIRMATION**
+━━━━━━━━━━━━━━━━━━━━
+Are you sure you want to permanently delete:
+**{bot_name}**?
+
+This action cannot be undone!
+━━━━━━━━━━━━━━━━━━━━
+        """
+        
+        bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        bot.send_message(message.chat.id, "❌ Verification failed. Deletion cancelled.", 
+                        reply_markup=main_menu(message.from_user.id))
+
+def confirm_delete_bot(call, bot_id):
+    conn = sqlite3.connect(Config.DB_NAME)
+    c = conn.cursor()
+    
+    # Get bot info before deleting
+    bot_info = c.execute("SELECT filename FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    
+    if bot_info:
+        filename = bot_info[0]
+        file_path = project_path / filename
+        if file_path.exists():
+            file_path.unlink()
+    
+    c.execute("DELETE FROM deployments WHERE id=?", (bot_id,))
+    conn.commit()
+    conn.close()
+    
+    bot.answer_callback_query(call.id, "✅ Bot deleted successfully!")
+    show_my_bots(call)
+
+def export_bot_files(call, bot_id):
+    conn = sqlite3.connect(Config.DB_NAME)
+    c = conn.cursor()
+    bot_info = c.execute("SELECT bot_name, filename FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    conn.close()
+    
+    if not bot_info:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
+        return
+    
+    bot_name, filename = bot_info
+    file_path = project_path / filename
+    
+    if not file_path.exists():
+        bot.answer_callback_query(call.id, "❌ Bot file not found!")
+        return
+    
+    try:
+        # Create backup directory
+        backup_dir = Path('exports')
+        backup_dir.mkdir(exist_ok=True)
+        
+        # Create zip file
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        zip_name = f"{bot_name}_{timestamp}.zip"
+        zip_path = backup_dir / zip_name
+        
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            zipf.write(file_path, filename)
+            
+            # Add bot info file
+            bot_info_data = {
+                'bot_name': bot_name,
+                'filename': filename,
+                'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'platform': 'Cyber Bot Hosting v4.0'
+            }
+            
+            info_file = backup_dir / 'bot_info.json'
+            with open(info_file, 'w') as f:
+                json.dump(bot_info_data, f, indent=2)
+            
+            zipf.write(info_file, 'bot_info.json')
+            info_file.unlink()
+        
+        # Send the file
+        with open(zip_path, 'rb') as f:
+            bot.send_document(call.message.chat.id, f, caption=f"📦 **Exported Bot:** {bot_name}")
+        
+        zip_path.unlink()
+        bot.answer_callback_query(call.id, "✅ Bot exported successfully!")
+        
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Export failed: {str(e)}")
 
 def calculate_uptime(start_time_str):
     try:
@@ -900,17 +1113,14 @@ def stop_bot(call, bot_id):
     conn = sqlite3.connect(Config.DB_NAME)
     c = conn.cursor()
     
-    # Get PID
     bot_info = c.execute("SELECT pid FROM deployments WHERE id=?", (bot_id,)).fetchone()
     if bot_info and bot_info[0]:
         try:
-            # Try to kill process
             os.killpg(os.getpgid(bot_info[0]), signal.SIGTERM)
             time.sleep(1)
         except:
             pass
     
-    # Update status
     c.execute("UPDATE deployments SET status='Stopped', pid=0 WHERE id=?", (bot_id,))
     conn.commit()
     conn.close()
@@ -931,7 +1141,6 @@ def show_dashboard(call):
     running_bots = sum(1 for b in bots if b[5] == "Running")
     total_bots = len(bots)
     
-    # Get system stats
     stats = get_system_stats()
     cpu_usage = stats['cpu_percent']
     ram_usage = stats['ram_percent']
@@ -960,9 +1169,9 @@ def show_dashboard(call):
 • Disk: {disk_bar} {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 💻 **Hosting Platform:**
-• Platform: ULTIMATE FLOW 
-• Type: Web Service 
-• Region: Asia/kushtia🇧🇩
+• Platform: Render.com
+• Type: Web Service
+• Region: Global
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -991,64 +1200,269 @@ Select an option below:
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
                          reply_markup=admin_menu(), parse_mode="Markdown")
 
-def show_all_users(call):
+def show_all_users_paged(call, page=1):
     conn = sqlite3.connect(Config.DB_NAME)
     c = conn.cursor()
     users = c.execute("SELECT id, username, expiry, file_limit, is_prime FROM users").fetchall()
     conn.close()
     
+    items_per_page = 10
+    total_pages = (len(users) + items_per_page - 1) // items_per_page
+    page = max(1, min(page, total_pages))
+    
+    start_idx = (page - 1) * items_per_page
+    end_idx = start_idx + items_per_page
+    page_users = users[start_idx:end_idx]
+    
     prime_count = sum(1 for u in users if u[4] == 1)
     total_count = len(users)
     
     text = f"""
-👥 **ALL USERS**
+👥 **ALL USERS** (Page {page}/{total_pages})
 ━━━━━━━━━━━━━━━━━━━━
 📊 **Total Users:** {total_count}
 👑 **Prime Users:** {prime_count}
 🆓 **Free Users:** {total_count - prime_count}
 ━━━━━━━━━━━━━━━━━━━━
-**Recent Users:**
+**Users List:**
 """
     
-    for user in users[:10]:
+    for user in page_users:
         username = user[1] if user[1] else f"User_{user[0]}"
-        text += f"\n• {username} (ID: {user[0]}) - {'Prime' if user[4] else 'Free'}"
-    
-    if len(users) > 10:
-        text += f"\n\n... and {len(users) - 10} more users"
+        status = "Prime 👑" if user[4] else "Free 🆓"
+        text += f"\n• {username} (ID: {user[0]}) - {status} - Limit: {user[3]}"
     
     markup = types.InlineKeyboardMarkup()
+    
+    pagination_buttons = []
+    if page > 1:
+        pagination_buttons.append(types.InlineKeyboardButton("◀️", callback_data=f"user_page_{page-1}"))
+    
+    pagination_buttons.append(types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="none"))
+    
+    if page < total_pages:
+        pagination_buttons.append(types.InlineKeyboardButton("▶️", callback_data=f"user_page_{page+1}"))
+    
+    if pagination_buttons:
+        markup.row(*pagination_buttons)
+    
+    markup.add(types.InlineKeyboardButton("📤 Export Database", callback_data="export_db"))
     markup.add(types.InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"))
     
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
                          reply_markup=markup, parse_mode="Markdown")
 
-def show_all_bots_admin(call):
+def show_all_bots_admin_paged(call, page=1):
     conn = sqlite3.connect(Config.DB_NAME)
     c = conn.cursor()
-    bots = c.execute("SELECT d.bot_name, d.status, d.start_time, u.username FROM deployments d LEFT JOIN users u ON d.user_id = u.id").fetchall()
+    bots = c.execute("SELECT d.id, d.bot_name, d.status, d.start_time, u.username FROM deployments d LEFT JOIN users u ON d.user_id = u.id").fetchall()
     conn.close()
     
-    running_bots = sum(1 for b in bots if b[1] == "Running")
+    items_per_page = 8
+    total_pages = (len(bots) + items_per_page - 1) // items_per_page
+    page = max(1, min(page, total_pages))
+    
+    start_idx = (page - 1) * items_per_page
+    end_idx = start_idx + items_per_page
+    page_bots = bots[start_idx:end_idx]
+    
+    running_bots = sum(1 for b in bots if b[2] == "Running")
     total_bots = len(bots)
     
     text = f"""
-🤖 **ALL BOTS**
+🤖 **ALL BOTS** (Page {page}/{total_pages})
 ━━━━━━━━━━━━━━━━━━━━
 📊 **Total Bots:** {total_bots}
 🟢 **Running:** {running_bots}
 🔴 **Stopped:** {total_bots - running_bots}
 ━━━━━━━━━━━━━━━━━━━━
-**Active Bots:**
+**Bots List:**
 """
     
-    for bot_info in bots[:5]:
-        if bot_info[1] == "Running":
-            username = bot_info[3] if bot_info[3] else "Unknown"
-            text += f"\n• {bot_info[0]} (@{username}) - {bot_info[1]}"
+    for bot_id, bot_name, status, start_time, username in page_bots:
+        status_icon = "🟢" if status == "Running" else "🔴"
+        username = username or "Unknown"
+        text += f"\n• {bot_name} (@{username}) - {status_icon} {status}"
     
     markup = types.InlineKeyboardMarkup()
+    
+    pagination_buttons = []
+    if page > 1:
+        pagination_buttons.append(types.InlineKeyboardButton("◀️", callback_data=f"admin_bot_page_{page-1}"))
+    
+    pagination_buttons.append(types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="none"))
+    
+    if page < total_pages:
+        pagination_buttons.append(types.InlineKeyboardButton("▶️", callback_data=f"admin_bot_page_{page+1}"))
+    
+    if pagination_buttons:
+        markup.row(*pagination_buttons)
+    
+    markup.add(types.InlineKeyboardButton("📤 Export All Bots", callback_data="export_db_bots"))
     markup.add(types.InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"))
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                         reply_markup=markup, parse_mode="Markdown")
+
+def show_database_view(call):
+    conn = sqlite3.connect(Config.DB_NAME)
+    c = conn.cursor()
+    
+    # Get table info
+    c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = c.fetchall()
+    
+    text = """
+🗃️ **DATABASE VIEW**
+━━━━━━━━━━━━━━━━━━━━
+**Available Tables:**
+"""
+    
+    for table in tables:
+        table_name = table[0]
+        c.execute(f"SELECT COUNT(*) FROM {table_name}")
+        count = c.fetchone()[0]
+        text += f"\n• {table_name}: {count} records"
+    
+    # Get total stats
+    c.execute("SELECT COUNT(*) FROM users")
+    total_users = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM deployments")
+    total_bots = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM keys")
+    total_keys = c.fetchone()[0]
+    
+    conn.close()
+    
+    text += f"""
+━━━━━━━━━━━━━━━━━━━━
+📊 **Database Stats:**
+• Users: {total_users}
+• Bots: {total_bots}
+• Keys: {total_keys}
+• Size: {os.path.getsize(Config.DB_NAME) / 1024:.2f} KB
+━━━━━━━━━━━━━━━━━━━━
+    """
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("💾 Backup Database", callback_data="export_db"))
+    markup.add(types.InlineKeyboardButton("📤 Export Schema", callback_data="export_schema"))
+    markup.add(types.InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"))
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                         reply_markup=markup, parse_mode="Markdown")
+
+def show_backup_system(call):
+    conn = sqlite3.connect(Config.DB_NAME)
+    c = conn.cursor()
+    
+    c.execute("SELECT COUNT(*) FROM backups")
+    total_backups = c.fetchone()[0]
+    
+    c.execute("SELECT id, backup_name, created_date, size_kb FROM backups ORDER BY id DESC LIMIT 5")
+    recent_backups = c.fetchall()
+    
+    conn.close()
+    
+    text = f"""
+💾 **BACKUP SYSTEM**
+━━━━━━━━━━━━━━━━━━━━
+📊 **Backup Stats:**
+• Total Backups: {total_backups}
+• Storage Used: {sum(b[3] for b in recent_backups):.2f} KB
+━━━━━━━━━━━━━━━━━━━━
+**Recent Backups:**
+"""
+    
+    for backup_id, backup_name, created_date, size_kb in recent_backups:
+        text += f"\n• {backup_name} ({size_kb:.1f} KB) - {created_date}"
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔄 Create Backup", callback_data="create_backup"))
+    markup.add(types.InlineKeyboardButton("📥 Download Latest", callback_data="download_latest_backup"))
+    markup.add(types.InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"))
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                         reply_markup=markup, parse_mode="Markdown")
+
+def export_database(call):
+    try:
+        # Create backup directory
+        backup_dir = Path('database_backups')
+        backup_dir.mkdir(exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_name = f"cyber_bot_db_{timestamp}.db"
+        backup_path = backup_dir / backup_name
+        
+        # Copy database
+        import shutil
+        shutil.copy2(Config.DB_NAME, backup_path)
+        
+        # Create zip with additional info
+        zip_name = f"database_backup_{timestamp}.zip"
+        zip_path = backup_dir / zip_name
+        
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            zipf.write(backup_path, backup_name)
+            
+            # Add info file
+            info_data = {
+                'backup_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'database': Config.DB_NAME,
+                'tables': ['users', 'deployments', 'keys', 'backups'],
+                'version': 'Cyber Bot Hosting v4.0'
+            }
+            
+            info_file = backup_dir / 'backup_info.json'
+            with open(info_file, 'w') as f:
+                json.dump(info_data, f, indent=2)
+            
+            zipf.write(info_file, 'backup_info.json')
+            info_file.unlink()
+        
+        # Send the file
+        with open(zip_path, 'rb') as f:
+            bot.send_document(call.message.chat.id, f, caption="💾 **Database Backup**")
+        
+        # Cleanup
+        backup_path.unlink()
+        zip_path.unlink()
+        
+        bot.answer_callback_query(call.id, "✅ Database exported successfully!")
+        
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Export failed: {str(e)}")
+
+def view_backup_details(call, backup_id):
+    conn = sqlite3.connect(Config.DB_NAME)
+    c = conn.cursor()
+    
+    backup_info = c.execute("SELECT * FROM backups WHERE id=?", (backup_id,)).fetchone()
+    conn.close()
+    
+    if not backup_info:
+        bot.answer_callback_query(call.id, "❌ Backup not found!")
+        return
+    
+    text = f"""
+📋 **BACKUP DETAILS**
+━━━━━━━━━━━━━━━━━━━━
+**Backup ID:** {backup_info[0]}
+**Name:** {backup_info[2]}
+**Bot ID:** {backup_info[1]}
+**Created:** {backup_info[4]}
+**Size:** {backup_info[5]:.2f} KB
+**Path:** `{backup_info[3]}`
+━━━━━━━━━━━━━━━━━━━━
+    """
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("📥 Download", callback_data=f"download_backup_{backup_id}"))
+    markup.add(types.InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_backup_{backup_id}"))
+    markup.add(types.InlineKeyboardButton("🔙 Backup System", callback_data="backup_system"))
     
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
                          reply_markup=markup, parse_mode="Markdown")
@@ -1057,7 +1471,6 @@ def show_admin_stats(call):
     conn = sqlite3.connect(Config.DB_NAME)
     c = conn.cursor()
     
-    # Get all stats
     total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     prime_users = c.execute("SELECT COUNT(*) FROM users WHERE is_prime=1").fetchone()[0]
     total_bots = c.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
@@ -1066,7 +1479,6 @@ def show_admin_stats(call):
     
     conn.close()
     
-    # System stats
     stats = get_system_stats()
     cpu_usage = stats['cpu_percent']
     ram_usage = stats['ram_percent']
@@ -1094,16 +1506,16 @@ def show_admin_stats(call):
 • Disk Usage: {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Info:**
-• Platform: ULTIMATE FLOW 
+• Platform: Render.com
 • Port: {Config.PORT}
-• Database: zenxq
+• Database: SQLite
 ━━━━━━━━━━━━━━━━━━━━
 """
     
     markup = types.InlineKeyboardMarkup()
     markup.add(
         types.InlineKeyboardButton("👥 Users", callback_data="all_users"),
-        types.InlineKeyboardButton("🤖 Bots", callback_data="all_bots")
+        types.InlineKeyboardButton("🤖 Bots", callback_data="all_bots_admin")
     )
     markup.add(types.InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"))
     
@@ -1143,13 +1555,17 @@ def show_premium_info(call):
 ✅ **Live Statistics**
 ✅ **24/7 Server Uptime**
 ✅ **No Ads**
+✅ **ZIP File Support**
+✅ **Bot Export Feature**
+✅ **API Key Management**
 ━━━━━━━━━━━━━━━━━━━━
 💎 **Get Prime Today!**
-Click 'Activate Prime Pass' and enter your key.
+Click 'Get Prime Pass' to contact admin.
 ━━━━━━━━━━━━━━━━━━━━
 """
     
     markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("💎 Get Prime Pass", url="https://t.me/zerox6t9"))
     markup.add(types.InlineKeyboardButton("🔑 Activate Prime", callback_data="activate_prime"))
     markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
     
@@ -1247,7 +1663,7 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🤖 Cyber Bot Hosting v3.0</title>
+        <title>🤖 Cyber Bot Hosting v4.0</title>
         <style>
             body {
                 font-family: Arial, sans-serif;
@@ -1328,7 +1744,7 @@ def home():
     </head>
     <body>
         <div class="container">
-            <h1><i class="fas fa-robot"></i> Cyber Bot Hosting v3.0</h1>
+            <h1><i class="fas fa-robot"></i> Cyber Bot Hosting v4.0</h1>
             
             <div class="status">
                 <h2><i class="fas fa-server"></i> Server Status: <span style="color: #4CAF50;">✅ ONLINE</span></h2>
@@ -1358,37 +1774,37 @@ def home():
                 </div>
             </div>
             
-            <h2><i class="fas fa-star"></i> Premium Features</h2>
+            <h2><i class="fas fa-star"></i> New Features</h2>
             
             <div class="feature">
-                <i class="fas fa-upload"></i>
+                <i class="fas fa-file-archive"></i>
                 <div>
-                    <h3>Bot File Upload</h3>
-                    <p>Upload and deploy your Python bots easily</p>
+                    <h3>ZIP File Support</h3>
+                    <p>Upload ZIP files with multiple Python files</p>
                 </div>
             </div>
             
             <div class="feature">
-                <i class="fas fa-chart-line"></i>
+                <i class="fas fa-download"></i>
                 <div>
-                    <h3>Live Statistics</h3>
-                    <p>Real-time monitoring of your bots</p>
+                    <h3>Bot Export</h3>
+                    <p>Export your bots as ZIP files</p>
                 </div>
             </div>
             
             <div class="feature">
-                <i class="fas fa-cogs"></i>
+                <i class="fas fa-key"></i>
                 <div>
-                    <h3>Library Installation</h3>
-                    <p>Install required libraries automatically</p>
+                    <h3>API Key System</h3>
+                    <p>Each bot gets unique API key</p>
                 </div>
             </div>
             
             <div class="feature">
-                <i class="fas fa-tachometer-alt"></i>
+                <i class="fas fa-database"></i>
                 <div>
-                    <h3>Performance Dashboard</h3>
-                    <p>Monitor CPU, RAM, and disk usage</p>
+                    <h3>Database Management</h3>
+                    <p>Advanced admin database tools</p>
                 </div>
             </div>
             
@@ -1413,7 +1829,7 @@ def home():
 
 @app.route('/health')
 def health():
-    return {"status": "healthy", "service": "Cyber Bot Hosting", "port": Config.PORT}
+    return {"status": "healthy", "service": "Cyber Bot Hosting v4.0", "port": Config.PORT}
 
 # Start Bot and Server for Render
 def start_bot():
@@ -1427,9 +1843,9 @@ def start_bot():
 
 if __name__ == '__main__':
     print(f"""
-🤖 CYBER BOT HOSTING v3.0
+🤖 CYBER BOT HOSTING v4.0
 ━━━━━━━━━━━━━━━━━━━━
-🚀 Starting on Zen bot
+🚀 Starting on Render.com
 • Port: {Config.PORT}
 • Admin ID: {Config.ADMIN_ID}
 • Database: ✅
@@ -1437,7 +1853,6 @@ if __name__ == '__main__':
 ━━━━━━━━━━━━━━━━━━━━
     """)
     
-    # Start bot in separate thread
     bot_thread = threading.Thread(target=start_bot, daemon=True)
     bot_thread.start()
     
@@ -1445,5 +1860,4 @@ if __name__ == '__main__':
     print(f"🌐 Flask server starting on port {Config.PORT}")
     print("━━━━━━━━━━━━━━━━━━━━")
     
-    # Start Flask app (Render will use this)
     app.run(host='0.0.0.0', port=Config.PORT, debug=False, use_reloader=False)
