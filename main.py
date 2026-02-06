@@ -19,8 +19,8 @@ from flask import Flask, render_template_string, send_file, Response
 
 # ১. Configuration
 class Config:
-    TOKEN = os.environ.get('BOT_TOKEN', '8144529389:AAHmMAKR3VS2lWOEQ3VQXLGU-nHXFm2yuXM')
-    ADMIN_ID = int(os.environ.get('ADMIN_ID', 6926993789))
+    TOKEN = os.environ.get('BOT_TOKEN', '8494225623:AAG_HRSHoBpt36bdeUvYJL4ONnh-2bf6BnY')
+    ADMIN_ID = int(os.environ.get('ADMIN_ID', 7832264582))
     PROJECT_DIR = 'projects'
     DB_NAME = 'cyber_v2.db'
     PORT = int(os.environ.get('PORT', 10000))  # Render uses PORT environment variable
@@ -259,7 +259,8 @@ def welcome(message):
     expiry = user[2] if user[2] else "Not Activated"
     
     text = f"""
-🤖 **CYBER BOT HOSTING v3.0**
+🤖 **ZEN X HOST BOT v3.0.1**
+dev:@zerox6t9 | pv:@rifatbro22
 ━━━━━━━━━━━━━━━━━━━━
 👤 **User:** @{username}
 🆔 **ID:** `{uid}`
@@ -322,7 +323,7 @@ Format: `PRIME-XXXXXX`
 📤 **UPLOAD BOT FILE**
 ━━━━━━━━━━━━━━━━━━━━
 Please send your Python (.py) bot file or ZIP file containing bot.
-• Max size: 5MB
+• Max size: 5.5MB
 • Allowed: .py, .zip
 ━━━━━━━━━━━━━━━━━━━━
             """, chat_id, mid, parse_mode="Markdown")
@@ -1218,9 +1219,9 @@ def show_dashboard(call):
 • Disk: {disk_bar} {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 💻 **Hosting Platform:**
-• Platform: Render.com
+• Platform: ULTIMATE FLOW 
 • Type: Web Service
-• Region: Global
+• Region: asia-->kushtia🇧🇩
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1352,9 +1353,9 @@ def show_admin_stats(call):
 • Disk Usage: {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Info:**
-• Platform: Render.com
+• Platform: Cyber Host 
 • Port: {Config.PORT}
-• Database: SQLite
+• Database: zenxq
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1686,7 +1687,7 @@ def home():
             
             <div class="status">
                 <h2><i class="fas fa-server"></i> Server Status: <span style="color: #4CAF50;">✅ ONLINE</span></h2>
-                <p>Bot hosting service is running smoothly on Render.com</p>
+                <p>Bot hosting service is running smoothly on ultimate flow and cyber host</p>
             </div>
             
             <div class="stats">
@@ -1747,17 +1748,17 @@ def home():
             </div>
             
             <div style="text-align: center; margin: 40px 0;">
-                <a href="https://t.me/cyber_bot_hosting_bot" class="btn" target="_blank">
+                <a href="https://t.me/zen_xbot" class="btn" target="_blank">
                     <i class="fab fa-telegram"></i> Start on Telegram
                 </a>
-                <a href="https://render.com" class="btn" target="_blank" style="background: linear-gradient(45deg, #00b09b, #96c93d);">
-                    <i class="fas fa-cloud"></i> Hosted on Render
+                <a href="https://192.168.0.0.0:5005" class="btn" target="_blank" style="background: linear-gradient(45deg, #00b09b, #96c93d);">
+                    <i class="fas fa-cloud"></i> Hosted on Cyber host
                 </a>
             </div>
             
             <div class="footer">
                 <p><i class="fas fa-info-circle"></i> System Port: """ + str(Config.PORT) + """ | Python 3.9+ | SQLite Database</p>
-                <p>© 2024 Cyber Bot Hosting. All rights reserved.</p>
+                <p>© 2026 Cyber Bot Hosting. All rights reserved.</p>
             </div>
         </div>
     </body>
@@ -1805,7 +1806,7 @@ if __name__ == '__main__':
     print(f"""
 🤖 CYBER BOT HOSTING v3.0
 ━━━━━━━━━━━━━━━━━━━━
-🚀 Starting on Render.com
+🚀 Starting on ultimate flow 
 • Port: {Config.PORT}
 • Admin ID: {Config.ADMIN_ID}
 • Admin Username: {Config.ADMIN_USERNAME}
