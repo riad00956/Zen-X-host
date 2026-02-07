@@ -24,6 +24,9 @@ from concurrent.futures import ThreadPoolExecutor
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Global variable to track if bot is running
+bot_running = False
+
 # ১. Configuration
 class Config:
     TOKEN = os.environ.get('BOT_TOKEN', '8494225623:AAG_HRSHoBpt36bdeUvYJL4ONnh-2bf6BnY')
@@ -36,12 +39,11 @@ class Config:
     BOT_USERNAME = 'zen_xbot'
     MAX_BOTS_PER_USER = 5
     MAX_CONCURRENT_DEPLOYMENTS = 4
+    # Updated to 300 capacity nodes
     HOSTING_NODES = [
-        {"name": "Node-1", "status": "active", "capacity": 10},
-        {"name": "Node-2", "status": "active", "capacity": 10},
-        {"name": "Node-3", "status": "active", "capacity": 10},
-        {"name": "Node-4", "status": "active", "capacity": 10},
-        {"name": "Node-5", "status": "active", "capacity": 10}
+        {"name": "Node-1", "status": "active", "capacity": 300},
+        {"name": "Node-2", "status": "active", "capacity": 300},
+        {"name": "Node-3", "status": "active", "capacity": 300}
     ]
 
 bot = telebot.TeleBot(Config.TOKEN, parse_mode="Markdown")
@@ -66,7 +68,6 @@ def init_db():
     c.execute("DROP TABLE IF EXISTS keys")
     c.execute("DROP TABLE IF EXISTS deployments")
     c.execute("DROP TABLE IF EXISTS nodes")
-    c.execute("DROP TABLE IF EXISTS user_sessions")
     
     # Create new tables with enhanced structure
     c.execute('''CREATE TABLE users 
@@ -93,7 +94,7 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
              (Config.ADMIN_ID, 'admin', expiry_date, 100, 1, join_date, join_date, 0))
     
-    # Initialize hosting nodes
+    # Initialize hosting nodes with 300 capacity
     for i, node in enumerate(Config.HOSTING_NODES, 1):
         c.execute("INSERT INTO nodes (name, status, capacity, last_check) VALUES (?, ?, ?, ?)",
                  (node['name'], node['status'], node['capacity'], join_date))
@@ -112,11 +113,25 @@ def get_db():
 # System Monitoring Functions
 def get_system_stats():
     """Get system statistics"""
+    conn = get_db()
+    c = conn.cursor()
+    
+    total_bots = c.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
+    running_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE status='Running'").fetchone()[0]
+    total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    
+    conn.close()
+    
     stats = {
         'cpu_percent': random.randint(5, 40),
         'ram_percent': random.randint(15, 60),
         'disk_percent': random.randint(20, 70),
-        'uptime_days': random.randint(1, 365)
+        'total_users': total_users,
+        'total_bots': total_bots,
+        'running_bots': running_bots,
+        'uptime_days': random.randint(1, 365),
+        'total_capacity': len(Config.HOSTING_NODES) * 300,
+        'available_capacity': (len(Config.HOSTING_NODES) * 300) - running_bots
     }
     return stats
 
@@ -225,9 +240,9 @@ def create_zip_file(bot_id, bot_name, filename, user_id):
                 'filename': filename,
                 'user_id': user_id,
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': 'ZEN X HOST BOT v3.1.0',
+                'version': 'ZEN X HOST BOT v3.2.0',
                 'exported_by': 'ZEN X Bot Hosting System',
-                'node_info': 'Multi-Node Hosting System'
+                'node_info': '300-Capacity Multi-Node Hosting'
             }
             
             # Create metadata file in zip
@@ -291,9 +306,9 @@ def update_message_history(user_id, message_id):
     
     user_message_history[user_id].append(message_id)
     
-    # Keep only last 10 messages
-    if len(user_message_history[user_id]) > 10:
-        user_message_history[user_id] = user_message_history[user_id][-10:]
+    # Keep only last 5 messages
+    if len(user_message_history[user_id]) > 5:
+        user_message_history[user_id] = user_message_history[user_id][-5:]
 
 def cleanup_old_messages(user_id):
     """Cleanup old messages for user"""
@@ -443,8 +458,8 @@ def handle_commands(message):
         plan = "Premium"
     
     text = f"""
-🤖 **ZEN X HOST BOT v3.1.0**
-*Multi-Node Hosting System*
+🤖 **ZEN X HOST BOT v3.2.0**
+*300-Capacity Multi-Node Hosting System*
 ━━━━━━━━━━━━━━━━━━━━
 👤 **User:** @{username}
 🆔 **ID:** `{uid}`
@@ -673,6 +688,8 @@ def handle_dashboard(message, last_msg_id=None):
     # Get node status
     nodes = get_available_nodes()
     active_nodes = len(nodes)
+    total_capacity = sum(node['capacity'] for node in nodes)
+    used_capacity = sum(node['current_load'] for node in nodes)
     
     text = f"""
 📊 **USER DASHBOARD**
@@ -688,9 +705,10 @@ def handle_dashboard(message, last_msg_id=None):
 • RAM: {ram_bar} {ram_usage:.1f}%
 • Disk: {disk_bar} {disk_usage:.1f}%
 • Active Nodes: {active_nodes}/{len(Config.HOSTING_NODES)}
+• Capacity: {used_capacity}/{total_capacity} bots
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Platform:**
-• Platform: ZEN X MULTI-NODE 
+• Platform: ZEN X 300-CAPACITY NODES
 • Type: Web Service
 • Max Concurrent: {Config.MAX_CONCURRENT_DEPLOYMENTS}
 • Region: Asia → Bangladesh 🇧🇩
@@ -720,7 +738,7 @@ def handle_settings(message, last_msg_id=None):
 • Join Date: {user['join_date']}
 ━━━━━━━━━━━━━━━━━━━━
 🔧 **Bot Settings:**
-• Auto-restart: Disabled
+• Auto-restart: Enabled
 • Notifications: Enabled
 • Language: English
 ━━━━━━━━━━━━━━━━━━━━
@@ -743,7 +761,7 @@ def handle_premium_info(message, last_msg_id=None):
     text = f"""
 👑 **PREMIUM FEATURES**
 ━━━━━━━━━━━━━━━━━━━━
-✅ **Multi-Node Bot Deployment**
+✅ **300-Capacity Node Hosting**
 ✅ **Priority Support**
 ✅ **Advanced Monitoring**
 ✅ **Custom Bot Names**
@@ -854,8 +872,10 @@ Select an option from the keyboard below:
 
 def handle_admin_buttons(message, button_text, last_msg_id=None):
     uid = message.from_user.id
+    chat_id = message.chat.id
+    
     if uid != Config.ADMIN_ID:
-        edit_or_send_message(message.chat.id, last_msg_id, "⛔ Access Denied!")
+        edit_or_send_message(chat_id, last_msg_id, "⛔ Access Denied!")
         return
     
     if button_text == "🎫 Generate Key":
@@ -882,10 +902,6 @@ def handle_document(message):
     session = get_user_session(uid)
     
     if session.get('state') != 'waiting_for_file':
-        return
-    
-    if message.content_type != 'document':
-        bot.reply_to(message, "❌ Please send a file!")
         return
     
     try:
@@ -967,10 +983,7 @@ Example: `News Bot`, `Music Bot`, `Assistant`
                 update_message_history(uid, msg.message_id)
                 bot.register_next_step_handler(msg, process_bot_name_input)
                 return
-            else:
-                bot.reply_to(message, "❌ **Error extracting ZIP file!**")
-                return
-        
+            
         # Handle regular Python file
         safe_name = secure_filename(original_name)
         
@@ -1205,8 +1218,8 @@ def process_duration_input(message):
 ━━━━━━━━━━━━━━━━━━━━
 Step 2/3: Duration set to **{days} days**
 
-Now enter file access limit
-Example: 3, 5, 10
+Now enter file access limit (1-100):
+Example: 3, 5, 10, 50
 ━━━━━━━━━━━━━━━━━━━━
 """
         edit_or_send_message(chat_id, None, text)
@@ -1226,8 +1239,9 @@ def process_limit_input(message):
     
     try:
         limit = int(message.text.strip())
-        if limit <= 0:
-            raise ValueError
+        if limit <= 0 or limit > 100:
+            edit_or_send_message(chat_id, None, "❌ Limit must be between 1 and 100!")
+            return
         
         session = get_user_session(uid)
         days = session.get('days', 30)
@@ -1374,7 +1388,7 @@ def start_deployment(call, file_id):
 🚀 **DEPLOYING BOT**
 ━━━━━━━━━━━━━━━━━━━━
 🤖 **Bot:** {bot_name}
-🌐 **Node:** {node['name']}
+🌐 **Node:** {node['name']} (Capacity: {node['capacity']})
 🔄 **Status:** Starting...
 ━━━━━━━━━━━━━━━━━━━━
 """
@@ -1412,7 +1426,7 @@ def start_deployment(call, file_id):
 ✅ **BOT DEPLOYED SUCCESSFULLY**
 ━━━━━━━━━━━━━━━━━━━━
 🤖 **Bot:** {bot_name}
-🌐 **Node:** {node['name']}
+🌐 **Node:** {node['name']} ({node['current_load']+1}/{node['capacity']})
 ⚙️ **PID:** `{proc.pid}`
 ⏰ **Started:** {start_time}
 🔧 **Status:** **RUNNING**
@@ -1826,6 +1840,9 @@ def show_admin_stats(message, last_msg_id=None):
     ram_usage = stats['ram_percent']
     disk_usage = stats['disk_percent']
     
+    total_capacity = len(Config.HOSTING_NODES) * 300
+    available_capacity = total_capacity - running_bots
+    
     text = f"""
 📈 **ADMIN STATISTICS**
 ━━━━━━━━━━━━━━━━━━━━
@@ -1848,9 +1865,12 @@ def show_admin_stats(message, last_msg_id=None):
 • Disk Usage: {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Info:**
-• Platform: ZEN X HOST v3.1.0
+• Platform: ZEN X HOST v3.2.0
 • Port: {Config.PORT}
-• Nodes: {len(Config.HOSTING_NODES)}
+• Nodes: {len(Config.HOSTING_NODES)} x 300 capacity
+• Total Capacity: {total_capacity} bots
+• Used Capacity: {running_bots} bots
+• Available: {available_capacity} bots
 • Bot: @{Config.BOT_USERNAME}
 ━━━━━━━━━━━━━━━━━━━━
 """
@@ -1958,8 +1978,16 @@ def show_nodes_status(message, last_msg_id=None):
     nodes = c.execute("SELECT * FROM nodes").fetchall()
     conn.close()
     
-    text = """
+    total_capacity = sum(node['capacity'] for node in nodes)
+    used_capacity = sum(node['current_load'] for node in nodes)
+    available_capacity = total_capacity - used_capacity
+    
+    text = f"""
 🌐 **NODES STATUS**
+━━━━━━━━━━━━━━━━━━━━
+**Total Capacity:** {total_capacity} bots
+**Used Capacity:** {used_capacity} bots
+**Available:** {available_capacity} bots
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -2018,25 +2046,53 @@ def extract_zip_file(zip_path, extract_to):
         logger.error(f"Error extracting zip: {e}")
         return False
 
+# Single instance bot polling with error handling
+def start_bot_safely():
+    """Start bot with single instance protection"""
+    global bot_running
+    
+    if bot_running:
+        logger.info("Bot is already running, skipping...")
+        return
+    
+    bot_running = True
+    logger.info("Starting bot polling...")
+    
+    while True:
+        try:
+            logger.info("Bot polling started...")
+            bot.polling(none_stop=True, timeout=60)
+        except Exception as e:
+            logger.error(f"Bot polling error: {e}")
+            if "409" in str(e):
+                logger.warning("Conflict detected, waiting 10 seconds...")
+                time.sleep(10)
+            else:
+                logger.warning("Other error, waiting 5 seconds...")
+                time.sleep(5)
+
 # Flask Routes for Render
 @app.route('/')
 def home():
-    html = """
+    stats = get_system_stats()
+    total_capacity = len(Config.HOSTING_NODES) * 300
+    
+    html = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🤖 ZEN X MULTI-NODE HOST BOT v3.1.0</title>
+        <title>🤖 ZEN X 300-CAPACITY HOST BOT v3.2.0</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body {
+            body {{
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 color: white;
                 margin: 0;
                 padding: 20px;
                 min-height: 100vh;
-            }
-            .container {
+            }}
+            .container {{
                 max-width: 900px;
                 margin: 0 auto;
                 background: rgba(255, 255, 255, 0.1);
@@ -2045,29 +2101,29 @@ def home():
                 backdrop-filter: blur(10px);
                 box-shadow: 0 15px 35px rgba(0, 0, 0, 0.3);
                 border: 1px solid rgba(255, 255, 255, 0.2);
-            }
-            h1 {
+            }}
+            h1 {{
                 text-align: center;
                 font-size: 2.8em;
                 margin-bottom: 20px;
                 color: #fff;
                 text-shadow: 0 2px 10px rgba(0,0,0,0.3);
-            }
-            .subtitle {
+            }}
+            .subtitle {{
                 text-align: center;
                 font-size: 1.2em;
                 margin-bottom: 40px;
                 opacity: 0.9;
-            }
-            .status {
+            }}
+            .status {{
                 background: rgba(255, 255, 255, 0.15);
                 padding: 25px;
                 border-radius: 15px;
                 margin: 25px 0;
                 border-left: 6px solid #4CAF50;
                 box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
-            }
-            .feature {
+            }}
+            .feature {{
                 background: rgba(255, 255, 255, 0.1);
                 padding: 20px;
                 margin: 15px 0;
@@ -2076,40 +2132,40 @@ def home():
                 align-items: center;
                 transition: transform 0.3s, background 0.3s;
                 border: 1px solid rgba(255, 255, 255, 0.1);
-            }
-            .feature:hover {
+            }}
+            .feature:hover {{
                 transform: translateY(-5px);
                 background: rgba(255, 255, 255, 0.2);
-            }
-            .feature i {
+            }}
+            .feature i {{
                 margin-right: 20px;
                 font-size: 1.8em;
                 color: #FFD700;
-            }
-            .stats {
+            }}
+            .stats {{
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
                 gap: 20px;
                 margin: 40px 0;
-            }
-            .stat-box {
+            }}
+            .stat-box {{
                 background: rgba(255, 255, 255, 0.15);
                 padding: 25px;
                 border-radius: 15px;
                 text-align: center;
                 transition: transform 0.3s;
                 border: 1px solid rgba(255, 255, 255, 0.1);
-            }
-            .stat-box:hover {
+            }}
+            .stat-box:hover {{
                 transform: translateY(-5px);
                 background: rgba(255, 255, 255, 0.2);
-            }
-            .stat-box i {
+            }}
+            .stat-box i {{
                 font-size: 2.5em;
                 margin-bottom: 15px;
                 color: #4CAF50;
-            }
-            .btn {
+            }}
+            .btn {{
                 display: inline-block;
                 background: linear-gradient(45deg, #FF416C, #FF4B2B);
                 color: white;
@@ -2122,81 +2178,81 @@ def home():
                 border: none;
                 font-size: 1.1em;
                 box-shadow: 0 5px 15px rgba(255, 65, 108, 0.4);
-            }
-            .btn:hover {
+            }}
+            .btn:hover {{
                 transform: translateY(-3px);
                 box-shadow: 0 8px 20px rgba(255, 65, 108, 0.6);
-            }
-            .btn-telegram {
+            }}
+            .btn-telegram {{
                 background: linear-gradient(45deg, #0088cc, #00aced);
                 box-shadow: 0 5px 15px rgba(0, 136, 204, 0.4);
-            }
-            .btn-telegram:hover {
+            }}
+            .btn-telegram:hover {{
                 box-shadow: 0 8px 20px rgba(0, 136, 204, 0.6);
-            }
-            .btn-success {
+            }}
+            .btn-success {{
                 background: linear-gradient(45deg, #00b09b, #96c93d);
                 box-shadow: 0 5px 15px rgba(0, 176, 155, 0.4);
-            }
-            .btn-success:hover {
+            }}
+            .btn-success:hover {{
                 box-shadow: 0 8px 20px rgba(0, 176, 155, 0.6);
-            }
-            .footer {
+            }}
+            .footer {{
                 text-align: center;
                 margin-top: 50px;
                 padding-top: 30px;
                 border-top: 1px solid rgba(255, 255, 255, 0.3);
                 font-size: 0.9em;
                 opacity: 0.8;
-            }
-            .btn-container {
+            }}
+            .btn-container {{
                 text-align: center;
                 margin: 40px 0;
-            }
-            @media (max-width: 768px) {
-                .container {
+            }}
+            @media (max-width: 768px) {{
+                .container {{
                     padding: 20px;
                     margin: 10px;
-                }
-                h1 {
+                }}
+                h1 {{
                     font-size: 2em;
-                }
-                .stats {
+                }}
+                .stats {{
                     grid-template-columns: 1fr;
-                }
-                .btn {
+                }}
+                .btn {{
                     display: block;
                     margin: 15px auto;
                     width: 80%;
-                }
-            }
+                }}
+            }}
         </style>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <link rel="icon" href="https://img.icons8.com/color/96/000000/telegram-app.png" type="image/x-icon">
     </head>
     <body>
         <div class="container">
-            <h1><i class="fas fa-robot"></i> ZEN X MULTI-NODE HOST</h1>
+            <h1><i class="fas fa-robot"></i> ZEN X 300-CAPACITY HOST</h1>
             <div class="subtitle">
-                Advanced Multi-Node Telegram Bot Hosting Platform v3.1.0
+                Advanced 300-Capacity Multi-Node Telegram Bot Hosting Platform v3.2.0
             </div>
             
             <div class="status">
                 <h2><i class="fas fa-server"></i> Server Status: <span style="color: #4CAF50; font-weight: bold;">✅ ONLINE & RUNNING</span></h2>
-                <p>Multi-Node bot hosting service is running smoothly on ULTIMATE FLOW infrastructure</p>
-                <p><i class="fas fa-info-circle"></i> Active Nodes: 5 | Max Concurrent: 4 per user</p>
+                <p>300-Capacity Multi-Node bot hosting service is running smoothly</p>
+                <p><i class="fas fa-info-circle"></i> Total Capacity: {total_capacity} bots | Active Nodes: {len(Config.HOSTING_NODES)}</p>
             </div>
             
             <div class="stats">
                 <div class="stat-box">
-                    <i class="fas fa-users"></i>
-                    <h3>Multi-User</h3>
-                    <p>Concurrent Hosting</p>
+                    <i class="fas fa-database"></i>
+                    <h3>{total_capacity} Capacity</h3>
+                    <p>High Performance Nodes</p>
                 </div>
                 <div class="stat-box">
                     <i class="fas fa-sitemap"></i>
                     <h3>Multi-Node</h3>
-                    <p>5 Active Nodes</p>
+                    <p>{len(Config.HOSTING_NODES)} Active Nodes</p>
                 </div>
                 <div class="stat-box">
                     <i class="fas fa-robot"></i>
@@ -2213,10 +2269,10 @@ def home():
             <h2 style="text-align: center; margin-top: 40px;"><i class="fas fa-star"></i> Premium Features</h2>
             
             <div class="feature">
-                <i class="fas fa-sitemap"></i>
+                <i class="fas fa-database"></i>
                 <div>
-                    <h3>Multi-Node Deployment</h3>
-                    <p>Deploy bots across 5 different nodes for better performance and reliability.</p>
+                    <h3>300-Capacity Nodes</h3>
+                    <p>Each node supports 300 concurrent bots for maximum scalability.</p>
                 </div>
             </div>
             
@@ -2261,20 +2317,20 @@ def home():
             </div>
             
             <div class="btn-container">
-                <a href="https://t.me/zen_xbot" class="btn btn-telegram" target="_blank">
+                <a href="https://t.me/{Config.BOT_USERNAME}" class="btn btn-telegram" target="_blank">
                     <i class="fab fa-telegram"></i> Start Bot on Telegram
                 </a>
-                <a href="https://t.me/zerox6t9" class="btn btn-success" target="_blank">
+                <a href="https://t.me/{Config.ADMIN_USERNAME}" class="btn btn-success" target="_blank">
                     <i class="fas fa-crown"></i> Get Prime Subscription
                 </a>
             </div>
             
             <div class="footer">
-                <p><i class="fas fa-code"></i> Powered by ZEN X Development Team | Version 3.1.0</p>
+                <p><i class="fas fa-code"></i> Powered by ZEN X Development Team | Version 3.2.0</p>
                 <p><i class="fas fa-map-marker-alt"></i> Hosting Region: Asia → Bangladesh 🇧🇩</p>
                 <p>© 2024-2026 ZEN X HOST BOT. All rights reserved.</p>
                 <p style="font-size: 0.8em; margin-top: 10px;">
-                    <i class="fas fa-heart" style="color: #ff4757;"></i> Multi-Node Hosting System
+                    <i class="fas fa-heart" style="color: #ff4757;"></i> 300-Capacity Multi-Node Hosting System
                 </p>
             </div>
         </div>
@@ -2296,41 +2352,27 @@ def health():
         
         conn.close()
         
+        stats = get_system_stats()
+        
         return jsonify({
             "status": "healthy",
-            "service": "ZEN X MULTI-NODE HOST BOT",
-            "version": "3.1.0",
+            "service": "ZEN X 300-CAPACITY HOST BOT",
+            "version": "3.2.0",
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "statistics": {
                 "total_users": total_users,
                 "total_bots": total_bots,
-                "running_bots": running_bots
+                "running_bots": running_bots,
+                "total_capacity": len(Config.HOSTING_NODES) * 300,
+                "available_capacity": (len(Config.HOSTING_NODES) * 300) - running_bots
             },
-            "system": get_system_stats(),
+            "system": stats,
             "nodes": len(Config.HOSTING_NODES)
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # Start Bot
-def start_bot_polling():
-    """Start bot polling with error handling"""
-    logger.info("🤖 Starting bot polling...")
-    
-    while True:
-        try:
-            logger.info("🔄 Starting bot polling cycle...")
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
-        except Exception as e:
-            logger.error(f"⚠️ Bot polling error: {e}")
-            
-            if "Conflict" in str(e) and "409" in str(e):
-                logger.info("🔄 Conflict error detected, waiting before restart...")
-                time.sleep(10)
-            else:
-                logger.info("🔄 Other error, waiting 5 seconds before restart...")
-                time.sleep(5)
-
 if __name__ == '__main__':
     # Create necessary directories
     Path('exports').mkdir(exist_ok=True)
@@ -2339,23 +2381,24 @@ if __name__ == '__main__':
     
     print(f"""
 {'='*60}
-🤖 ZEN X MULTI-NODE HOST BOT v3.1.0
+🤖 ZEN X 300-CAPACITY HOST BOT v3.2.0
 {'='*60}
 🚀 Starting server...
 • Port: {Config.PORT}
 • Admin: @{Config.ADMIN_USERNAME}
 • Bot: @{Config.BOT_USERNAME}
-• Nodes: {len(Config.HOSTING_NODES)}
+• Nodes: {len(Config.HOSTING_NODES)} x 300 capacity
+• Total Capacity: {len(Config.HOSTING_NODES) * 300} bots
 • Max Bots/User: {Config.MAX_BOTS_PER_USER}
 • Max Concurrent: {Config.MAX_CONCURRENT_DEPLOYMENTS}
 {'='*60}
     """)
     
-    # Start bot in separate thread
-    bot_thread = threading.Thread(target=start_bot_polling, daemon=True)
+    # Start bot in separate thread with single instance protection
+    bot_thread = threading.Thread(target=start_bot_safely, daemon=True)
     bot_thread.start()
     
-    print(f"✅ Telegram bot started in background thread")
+    print(f"✅ Telegram bot started with single instance protection")
     print(f"🌐 Flask server starting on port {Config.PORT}")
     print(f"📊 Health check: http://0.0.0.0:{Config.PORT}/health")
     print(f"🏠 Homepage: http://0.0.0.0:{Config.PORT}/")
