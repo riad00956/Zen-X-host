@@ -34,8 +34,8 @@ class Config:
     MAINTENANCE = False
     ADMIN_USERNAME = 'zerox6t9'
     BOT_USERNAME = 'zen_xbot'
-    MAX_BOTS_PER_USER = 5  # Max 5 bots per user
-    MAX_CONCURRENT_DEPLOYMENTS = 4  # Max 4 concurrent deployments
+    MAX_BOTS_PER_USER = 5
+    MAX_CONCURRENT_DEPLOYMENTS = 4
     HOSTING_NODES = [
         {"name": "Node-1", "status": "active", "capacity": 10},
         {"name": "Node-2", "status": "active", "capacity": 10},
@@ -54,6 +54,7 @@ executor = ThreadPoolExecutor(max_workers=10)
 
 # User session management
 user_sessions = {}
+user_message_history = {}
 
 # ২. Enhanced Database Functions
 def init_db():
@@ -86,9 +87,6 @@ def init_db():
                 (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, status TEXT, 
                  capacity INTEGER, current_load INTEGER DEFAULT 0, last_check TEXT)''')
     
-    c.execute('''CREATE TABLE user_sessions
-                (user_id INTEGER PRIMARY KEY, session_data TEXT, last_activity TEXT)''')
-    
     # Insert admin user
     join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     expiry_date = (datetime.now() + timedelta(days=3650)).strftime('%Y-%m-%d %H:%M:%S')
@@ -114,26 +112,12 @@ def get_db():
 # System Monitoring Functions
 def get_system_stats():
     """Get system statistics"""
-    conn = get_db()
-    c = conn.cursor()
-    
-    # Get actual stats from database
-    total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    total_bots = c.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
-    running_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE status='Running'").fetchone()[0]
-    
-    # Simulate resource usage
     stats = {
         'cpu_percent': random.randint(5, 40),
         'ram_percent': random.randint(15, 60),
         'disk_percent': random.randint(20, 70),
-        'total_users': total_users,
-        'total_bots': total_bots,
-        'running_bots': running_bots,
         'uptime_days': random.randint(1, 365)
     }
-    
-    conn.close()
     return stats
 
 def get_available_nodes():
@@ -300,6 +284,22 @@ def clear_user_session(user_id):
     if user_id in user_sessions:
         del user_sessions[user_id]
 
+def update_message_history(user_id, message_id):
+    """Update user's message history"""
+    if user_id not in user_message_history:
+        user_message_history[user_id] = []
+    
+    user_message_history[user_id].append(message_id)
+    
+    # Keep only last 10 messages
+    if len(user_message_history[user_id]) > 10:
+        user_message_history[user_id] = user_message_history[user_id][-10:]
+
+def cleanup_old_messages(user_id):
+    """Cleanup old messages for user"""
+    if user_id in user_message_history:
+        del user_message_history[user_id]
+
 # Keyboard Functions
 def get_main_keyboard(user_id):
     """Get main menu keyboard"""
@@ -311,9 +311,9 @@ def get_main_keyboard(user_id):
     if not prime_status['expired']:
         # Prime is active
         buttons = [
-            "📤 Upload Bot File",
+            "📤 Upload Bot",
             "🤖 My Bots",
-            "🚀 Deploy New Bot",
+            "🚀 Deploy Bot",
             "📊 Dashboard",
             "⚙️ Settings",
             "💎 Premium Info"
@@ -367,9 +367,9 @@ def get_bot_actions_keyboard(bot_id):
         types.InlineKeyboardButton("🔄 Restart", callback_data=f"restart_{bot_id}"),
         types.InlineKeyboardButton("📥 Export", callback_data=f"export_{bot_id}"),
         types.InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{bot_id}"),
-        types.InlineKeyboardButton("📜 Logs", callback_data=f"logs_{bot_id}"),
-        types.InlineKeyboardButton("🔙 Back", callback_data="my_bots")
+        types.InlineKeyboardButton("📜 Logs", callback_data=f"logs_{bot_id}")
     )
+    markup.add(types.InlineKeyboardButton("🔙 Back to Bots", callback_data="my_bots"))
     return markup
 
 def get_file_selection_keyboard(files):
@@ -379,6 +379,32 @@ def get_file_selection_keyboard(files):
         markup.add(types.InlineKeyboardButton(f"📁 {bot_name}", callback_data=f"select_{file_id}"))
     markup.add(types.InlineKeyboardButton("🔙 Cancel", callback_data="cancel"))
     return markup
+
+def get_yes_no_keyboard(action, bot_id):
+    """Get yes/no confirmation keyboard"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ Yes", callback_data=f"confirm_{action}_{bot_id}"),
+        types.InlineKeyboardButton("❌ No", callback_data=f"bot_{bot_id}")
+    )
+    return markup
+
+# Message Editing Helper
+def edit_or_send_message(chat_id, message_id, text, reply_markup=None, parse_mode="Markdown"):
+    """Edit existing message or send new one"""
+    try:
+        if message_id:
+            return bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
+        else:
+            msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+            update_message_history(chat_id, msg.message_id)
+            return msg
+    except Exception as e:
+        logger.error(f"Error editing/sending message: {e}")
+        # If edit fails, send new message
+        msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        update_message_history(chat_id, msg.message_id)
+        return msg
 
 # Message Handlers
 @bot.message_handler(commands=['start', 'menu', 'help'])
@@ -403,7 +429,7 @@ def handle_commands(message):
         user = get_user(uid)
     
     clear_user_session(uid)
-    set_user_session(uid, {'state': 'main_menu'})
+    cleanup_old_messages(uid)
     
     prime_status = check_prime_expiry(uid)
     
@@ -431,21 +457,27 @@ def handle_commands(message):
 • Expiry: {expiry_msg}
 • Total Bots: {user['total_bots_deployed'] or 0}
 ━━━━━━━━━━━━━━━━━━━━
-💡 *Use keyboard buttons or type commands*
-🔹 /start - Main menu
-🔹 /menu - Show menu
-🔹 /help - Help guide
-━━━━━━━━━━━━━━━━━━━━
+💡 *Use keyboard buttons below:*
 """
     
-    bot.send_message(message.chat.id, text, reply_markup=get_main_keyboard(uid))
+    msg = edit_or_send_message(message.chat.id, None, text, reply_markup=get_main_keyboard(uid))
+    update_message_history(uid, msg.message_id)
 
 @bot.message_handler(commands=['admin'])
 def handle_admin(message):
     uid = message.from_user.id
     if uid == Config.ADMIN_ID:
         set_user_session(uid, {'state': 'admin_panel'})
-        show_admin_panel(message)
+        cleanup_old_messages(uid)
+        text = """
+👑 **ADMIN CONTROL PANEL**
+━━━━━━━━━━━━━━━━━━━━
+Welcome to the admin dashboard.
+Select an option from the keyboard below:
+━━━━━━━━━━━━━━━━━━━━
+"""
+        msg = edit_or_send_message(message.chat.id, None, text, reply_markup=get_admin_keyboard())
+        update_message_history(uid, msg.message_id)
     else:
         bot.reply_to(message, "⛔ **Access Denied!**")
 
@@ -463,8 +495,10 @@ def handle_text_messages(message):
         process_bot_name_input(message)
     elif session.get('state') == 'waiting_for_libs':
         process_libraries_input(message)
-    elif session.get('state') == 'waiting_for_delete_confirm':
-        process_delete_confirm(message)
+    elif session.get('state') == 'waiting_for_duration':
+        process_duration_input(message)
+    elif session.get('state') == 'waiting_for_limit':
+        process_limit_input(message)
     else:
         # Handle main menu buttons
         handle_main_menu_buttons(message)
@@ -472,53 +506,59 @@ def handle_text_messages(message):
 def handle_main_menu_buttons(message):
     uid = message.from_user.id
     text = message.text
+    chat_id = message.chat.id
     
-    if text == "📤 Upload Bot File":
-        handle_upload_request(message)
+    # Get last message ID for editing
+    last_msg_id = user_message_history.get(uid, [None])[-1] if user_message_history.get(uid) else None
+    
+    if text == "📤 Upload Bot":
+        handle_upload_request(message, last_msg_id)
     elif text == "🤖 My Bots":
-        handle_my_bots(message)
-    elif text == "🚀 Deploy New Bot":
-        handle_deploy_new(message)
+        handle_my_bots(message, last_msg_id)
+    elif text == "🚀 Deploy Bot":
+        handle_deploy_new(message, last_msg_id)
     elif text == "📊 Dashboard":
-        handle_dashboard(message)
+        handle_dashboard(message, last_msg_id)
     elif text == "⚙️ Settings":
-        handle_settings(message)
+        handle_settings(message, last_msg_id)
     elif text == "💎 Premium Info":
-        handle_premium_info(message)
+        handle_premium_info(message, last_msg_id)
     elif text == "🔑 Activate Prime":
-        handle_activate_prime(message)
+        handle_activate_prime(message, last_msg_id)
     elif text == "📞 Contact Admin":
-        handle_contact_admin(message)
+        handle_contact_admin(message, last_msg_id)
     elif text == "ℹ️ Help":
-        handle_help(message)
+        handle_help(message, last_msg_id)
     elif text == "👑 Admin Panel":
-        handle_admin_panel(message)
+        handle_admin_panel(message, last_msg_id)
     elif text == "🏠 Main Menu":
         handle_commands(message)
     elif text in ["🎫 Generate Key", "👥 All Users", "🤖 All Bots", "📈 Statistics", 
                   "🗄️ View Database", "💾 Backup DB", "⚙️ Maintenance", "🌐 Nodes Status"]:
-        handle_admin_buttons(message, text)
+        handle_admin_buttons(message, text, last_msg_id)
     else:
         bot.reply_to(message, "❓ Unknown command. Use the keyboard buttons or /help")
 
 # Button Handlers
-def handle_upload_request(message):
+def handle_upload_request(message, last_msg_id=None):
     uid = message.from_user.id
     prime_status = check_prime_expiry(uid)
     
     if prime_status['expired']:
-        bot.reply_to(message, "⚠️ **Prime Required**\n\nYour Prime subscription has expired. Please renew to upload files.")
+        text = "⚠️ **Prime Required**\n\nYour Prime subscription has expired. Please renew to upload files."
+        edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=get_main_keyboard(uid))
         return
     
     # Check bot limit
     user_bots = get_user_bots(uid)
     if len(user_bots) >= Config.MAX_BOTS_PER_USER:
-        bot.reply_to(message, f"❌ **Bot Limit Reached**\n\nYou can only have {Config.MAX_BOTS_PER_USER} bots at a time.")
+        text = f"❌ **Bot Limit Reached**\n\nYou can only have {Config.MAX_BOTS_PER_USER} bots at a time."
+        edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=get_main_keyboard(uid))
         return
     
     set_user_session(uid, {'state': 'waiting_for_file'})
     
-    bot.reply_to(message, """
+    text = """
 📤 **UPLOAD BOT FILE**
 ━━━━━━━━━━━━━━━━━━━━
 Please send your Python (.py) bot file or ZIP file containing bot.
@@ -529,9 +569,10 @@ Please send your Python (.py) bot file or ZIP file containing bot.
 • Must have main function
 ━━━━━━━━━━━━━━━━━━━━
 *Send the file now or type 'cancel' to abort*
-    """)
+"""
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
-def handle_my_bots(message):
+def handle_my_bots(message, last_msg_id=None):
     uid = message.from_user.id
     bots = get_user_bots(uid)
     
@@ -544,46 +585,41 @@ def handle_my_bots(message):
 ━━━━━━━━━━━━━━━━━━━━
 No bots found. Upload your first bot!
 ━━━━━━━━━━━━━━━━━━━━
-        """
-        bot.reply_to(message, text, reply_markup=markup)
+"""
+        edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
         return
+    
+    running_bots = sum(1 for b in bots if b['status'] == "Running")
     
     text = f"""
 🤖 **MY BOTS**
 ━━━━━━━━━━━━━━━━━━━━
 **Total Bots:** {len(bots)}
+**Running:** {running_bots}
+**Stopped:** {len(bots) - running_bots}
 ━━━━━━━━━━━━━━━━━━━━
 """
     
+    # Send inline keyboard for each bot
+    markup = types.InlineKeyboardMarkup(row_width=1)
     for bot_info in bots:
         status_icon = "🟢" if bot_info['status'] == "Running" else "🔴"
-        text += f"\n{status_icon} **{bot_info['bot_name']}**"
-        text += f"\n• Status: {bot_info['status']}"
-        if bot_info['node_id']:
-            text += f"\n• Node: Node-{bot_info['node_id']}"
-        if bot_info['restart_count'] > 0:
-            text += f"\n• Restarts: {bot_info['restart_count']}"
-        text += f"\n• ID: `{bot_info['id']}`"
-        text += "\n━━━━━━━━━━━━━━━━\n"
-    
-    # Send inline keyboard for each bot
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    for bot_info in bots:
         markup.add(types.InlineKeyboardButton(
-            f"{bot_info['bot_name']}", 
+            f"{status_icon} {bot_info['bot_name']}", 
             callback_data=f"bot_{bot_info['id']}"
         ))
     
     markup.add(types.InlineKeyboardButton("📤 Upload New Bot", callback_data="upload"))
     
-    bot.reply_to(message, text, reply_markup=markup)
+    edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
 
-def handle_deploy_new(message):
+def handle_deploy_new(message, last_msg_id=None):
     uid = message.from_user.id
     prime_status = check_prime_expiry(uid)
     
     if prime_status['expired']:
-        bot.reply_to(message, "⚠️ **Prime Required**\n\nYour Prime subscription has expired. Please renew to deploy bots.")
+        text = "⚠️ **Prime Required**\n\nYour Prime subscription has expired. Please renew to deploy bots."
+        edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=get_main_keyboard(uid))
         return
     
     # Get available files
@@ -594,7 +630,8 @@ def handle_deploy_new(message):
     conn.close()
     
     if not files:
-        bot.reply_to(message, "📭 **No files available for deployment**\n\nUpload a file first.")
+        text = "📭 **No files available for deployment**\n\nUpload a file first."
+        edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=get_main_keyboard(uid))
         return
     
     text = """
@@ -604,18 +641,16 @@ Select a bot to deploy:
 ━━━━━━━━━━━━━━━━━━━━
 """
     
-    for file in files:
-        text += f"\n📁 **{file['bot_name']}**\nFile: `{file['filename']}`\n"
-    
     markup = get_file_selection_keyboard(files)
-    bot.reply_to(message, text, reply_markup=markup)
+    edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
 
-def handle_dashboard(message):
+def handle_dashboard(message, last_msg_id=None):
     uid = message.from_user.id
     user = get_user(uid)
     
     if not user:
-        bot.reply_to(message, "❌ User data not found")
+        text = "❌ User data not found"
+        edit_or_send_message(message.chat.id, last_msg_id, text)
         return
     
     bots = get_user_bots(uid)
@@ -648,7 +683,7 @@ def handle_dashboard(message):
 • Total Bots: {total_bots}/{Config.MAX_BOTS_PER_USER}
 • Running: {running_bots}
 ━━━━━━━━━━━━━━━━━━━━
-🖥️ **Server Status:**
+🖥️ **System Status:**
 • CPU: {cpu_bar} {cpu_usage:.1f}%
 • RAM: {ram_bar} {ram_usage:.1f}%
 • Disk: {disk_bar} {disk_usage:.1f}%
@@ -662,14 +697,15 @@ def handle_dashboard(message):
 ━━━━━━━━━━━━━━━━━━━━
 """
     
-    bot.reply_to(message, text)
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
-def handle_settings(message):
+def handle_settings(message, last_msg_id=None):
     uid = message.from_user.id
     user = get_user(uid)
     
     if not user:
-        bot.reply_to(message, "❌ User data not found")
+        text = "❌ User data not found"
+        edit_or_send_message(message.chat.id, last_msg_id, text)
         return
     
     prime_status = check_prime_expiry(uid)
@@ -701,9 +737,9 @@ def handle_settings(message):
         types.InlineKeyboardButton("🔔 Notifications", callback_data="notif_settings")
     )
     
-    bot.reply_to(message, text, reply_markup=markup)
+    edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
 
-def handle_premium_info(message):
+def handle_premium_info(message, last_msg_id=None):
     text = f"""
 👑 **PREMIUM FEATURES**
 ━━━━━━━━━━━━━━━━━━━━
@@ -735,9 +771,9 @@ Contact: @{Config.ADMIN_USERNAME}
     markup.add(types.InlineKeyboardButton("🔑 Activate/Renew", callback_data="activate_prime"))
     markup.add(types.InlineKeyboardButton("💎 Contact Admin", url=f"https://t.me/{Config.ADMIN_USERNAME}"))
     
-    bot.reply_to(message, text, reply_markup=markup)
+    edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
 
-def handle_activate_prime(message):
+def handle_activate_prime(message, last_msg_id=None):
     uid = message.from_user.id
     prime_status = check_prime_expiry(uid)
     
@@ -762,10 +798,9 @@ Format: `ZENX-XXXXXXXXXX`
         """
     
     set_user_session(uid, {'state': 'waiting_for_key'})
-    msg = bot.reply_to(message, text)
-    bot.register_next_step_handler(msg, process_key_input)
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
-def handle_contact_admin(message):
+def handle_contact_admin(message, last_msg_id=None):
     text = f"""
 📞 **CONTACT ADMIN**
 ━━━━━━━━━━━━━━━━━━━━
@@ -776,9 +811,9 @@ For support, issues, or premium purchase:
 📧 **Support:** @rifatbro22
 ━━━━━━━━━━━━━━━━━━━━
 """
-    bot.reply_to(message, text)
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
-def handle_help(message):
+def handle_help(message, last_msg_id=None):
     text = """
 ℹ️ **HELP GUIDE**
 ━━━━━━━━━━━━━━━━━━━━
@@ -799,39 +834,46 @@ def handle_help(message):
 • Inline buttons for specific actions
 ━━━━━━━━━━━━━━━━━━━━
 """
-    bot.reply_to(message, text)
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
-def handle_admin_panel(message):
+def handle_admin_panel(message, last_msg_id=None):
     uid = message.from_user.id
     if uid == Config.ADMIN_ID:
         set_user_session(uid, {'state': 'admin_panel'})
-        show_admin_panel(message)
-        bot.reply_to(message, "👑 **Admin Panel Activated**", reply_markup=get_admin_keyboard())
+        cleanup_old_messages(uid)
+        text = """
+👑 **ADMIN CONTROL PANEL**
+━━━━━━━━━━━━━━━━━━━━
+Welcome to the admin dashboard.
+Select an option from the keyboard below:
+━━━━━━━━━━━━━━━━━━━━
+"""
+        edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=get_admin_keyboard())
     else:
-        bot.reply_to(message, "⛔ Access Denied!")
+        edit_or_send_message(message.chat.id, last_msg_id, "⛔ Access Denied!")
 
-def handle_admin_buttons(message, button_text):
+def handle_admin_buttons(message, button_text, last_msg_id=None):
     uid = message.from_user.id
     if uid != Config.ADMIN_ID:
-        bot.reply_to(message, "⛔ Access Denied!")
+        edit_or_send_message(message.chat.id, last_msg_id, "⛔ Access Denied!")
         return
     
     if button_text == "🎫 Generate Key":
-        gen_key_step1(message)
+        gen_key_step1_message(message, last_msg_id)
     elif button_text == "👥 All Users":
-        show_all_users_admin(message)
+        show_all_users_admin(message, last_msg_id)
     elif button_text == "🤖 All Bots":
-        show_all_bots_admin(message)
+        show_all_bots_admin(message, last_msg_id)
     elif button_text == "📈 Statistics":
-        show_admin_stats(message)
+        show_admin_stats(message, last_msg_id)
     elif button_text == "🗄️ View Database":
-        view_database_admin(message)
+        view_database_admin(message, last_msg_id)
     elif button_text == "💾 Backup DB":
-        backup_database_admin(message)
+        backup_database_admin(message, last_msg_id)
     elif button_text == "⚙️ Maintenance":
-        toggle_maintenance_admin(message)
+        toggle_maintenance_admin(message, last_msg_id)
     elif button_text == "🌐 Nodes Status":
-        show_nodes_status(message)
+        show_nodes_status(message, last_msg_id)
 
 # File Upload Handler
 @bot.message_handler(content_types=['document'])
@@ -922,6 +964,7 @@ Enter a name for your bot (max 30 chars):
 Example: `News Bot`, `Music Bot`, `Assistant`
 ━━━━━━━━━━━━━━━━━━━━
                 """)
+                update_message_history(uid, msg.message_id)
                 bot.register_next_step_handler(msg, process_bot_name_input)
                 return
             else:
@@ -955,6 +998,7 @@ Enter a name for your bot (max 30 chars):
 Example: `News Bot`, `Music Bot`, `Assistant`
 ━━━━━━━━━━━━━━━━━━━━
         """)
+        update_message_history(uid, msg.message_id)
         bot.register_next_step_handler(msg, process_bot_name_input)
         
     except Exception as e:
@@ -963,13 +1007,14 @@ Example: `News Bot`, `Music Bot`, `Assistant`
 
 def process_bot_name_input(message):
     uid = message.from_user.id
-    session = get_user_session(uid)
+    chat_id = message.chat.id
     
     if message.text.lower() == 'cancel':
         clear_user_session(uid)
         bot.reply_to(message, "❌ Cancelled.", reply_markup=get_main_keyboard(uid))
         return
     
+    session = get_user_session(uid)
     if 'filename' not in session:
         bot.reply_to(message, "❌ Session expired. Please upload again.")
         return
@@ -1004,16 +1049,17 @@ def process_bot_name_input(message):
 📁 **File:** `{original_name}`
 📊 **Status:** Ready for setup
 ━━━━━━━━━━━━━━━━━━━━
-    """
+"""
     
-    bot.reply_to(message, text, reply_markup=markup)
+    edit_or_send_message(chat_id, None, text, reply_markup=markup)
 
 def process_key_input(message):
     uid = message.from_user.id
+    chat_id = message.chat.id
     
     if message.text.lower() == 'cancel':
         clear_user_session(uid)
-        bot.reply_to(message, "❌ Cancelled.", reply_markup=get_main_keyboard(uid))
+        edit_or_send_message(chat_id, None, "❌ Cancelled.", reply_markup=get_main_keyboard(uid))
         return
     
     key_input = message.text.strip().upper()
@@ -1078,7 +1124,7 @@ Enjoy all premium features!
         """
         
         clear_user_session(uid)
-        bot.reply_to(message, text, reply_markup=get_main_keyboard(uid))
+        edit_or_send_message(chat_id, None, text, reply_markup=get_main_keyboard(uid))
     else:
         conn.close()
         text = f"""
@@ -1089,19 +1135,20 @@ The key you entered is invalid or expired.
 Please check the key and try again.
 Or contact @{Config.ADMIN_USERNAME} for a new key.
         """
-        bot.reply_to(message, text)
+        edit_or_send_message(chat_id, None, text, reply_markup=get_main_keyboard(uid))
 
 def process_libraries_input(message):
     uid = message.from_user.id
+    chat_id = message.chat.id
     
     if message.text.lower() == 'cancel':
         clear_user_session(uid)
-        bot.reply_to(message, "❌ Cancelled.", reply_markup=get_main_keyboard(uid))
+        edit_or_send_message(chat_id, None, "❌ Cancelled.", reply_markup=get_main_keyboard(uid))
         return
     
     commands = [cmd.strip() for cmd in message.text.strip().split('\n') if cmd.strip()]
     
-    progress_msg = bot.reply_to(message, "🛠 **Installing libraries...**")
+    progress_msg = bot.send_message(chat_id, "🛠 **Installing libraries...**")
     
     results = []
     for i, cmd in enumerate(commands):
@@ -1127,11 +1174,91 @@ def process_libraries_input(message):
 {result_text}
 ━━━━━━━━━━━━━━━━━━━━
 All libraries installed successfully!
-    """
+"""
     
     clear_user_session(uid)
-    bot.edit_message_text(final_text, message.chat.id, progress_msg.message_id)
-    bot.send_message(message.chat.id, "📚 Libraries installed!", reply_markup=get_main_keyboard(uid))
+    bot.edit_message_text(final_text, chat_id, progress_msg.message_id)
+    edit_or_send_message(chat_id, None, "📚 Libraries installed!", reply_markup=get_main_keyboard(uid))
+
+def process_duration_input(message):
+    """Process duration input for key generation"""
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    
+    if message.text.lower() == 'cancel':
+        clear_user_session(uid)
+        edit_or_send_message(chat_id, None, "❌ Cancelled.", reply_markup=get_admin_keyboard())
+        return
+    
+    try:
+        days = int(message.text.strip())
+        if days <= 0:
+            raise ValueError
+        
+        set_user_session(uid, {
+            'state': 'waiting_for_limit',
+            'days': days
+        })
+        
+        text = f"""
+🎫 **GENERATE PRIME KEY**
+━━━━━━━━━━━━━━━━━━━━
+Step 2/3: Duration set to **{days} days**
+
+Now enter file access limit
+Example: 3, 5, 10
+━━━━━━━━━━━━━━━━━━━━
+"""
+        edit_or_send_message(chat_id, None, text)
+        
+    except:
+        edit_or_send_message(chat_id, None, "❌ Invalid input! Please enter a valid number.")
+
+def process_limit_input(message):
+    """Process limit input for key generation"""
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    
+    if message.text.lower() == 'cancel':
+        clear_user_session(uid)
+        edit_or_send_message(chat_id, None, "❌ Cancelled.", reply_markup=get_admin_keyboard())
+        return
+    
+    try:
+        limit = int(message.text.strip())
+        if limit <= 0:
+            raise ValueError
+        
+        session = get_user_session(uid)
+        days = session.get('days', 30)
+        
+        # Generate key
+        key = generate_random_key()
+        created_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("INSERT INTO keys (key, duration_days, file_limit, created_date) VALUES (?, ?, ?, ?)", 
+                 (key, days, limit, created_date))
+        conn.commit()
+        conn.close()
+        
+        clear_user_session(uid)
+        
+        text = f"""
+✅ **KEY GENERATED SUCCESSFULLY**
+━━━━━━━━━━━━━━━━━━━━
+🔑 **Key:** `{key}`
+⏰ **Duration:** {days} days
+📦 **File Limit:** {limit} files
+📅 **Created:** {created_date}
+━━━━━━━━━━━━━━━━━━━━
+Share this key with the user.
+"""
+        edit_or_send_message(chat_id, None, text, reply_markup=get_admin_keyboard())
+        
+    except:
+        edit_or_send_message(chat_id, None, "❌ Invalid input!")
 
 # Callback Query Handler
 @bot.callback_query_handler(func=lambda call: True)
@@ -1144,21 +1271,21 @@ def callback_manager(call):
         if call.data == "activate_prime":
             handle_activate_prime_callback(call)
         elif call.data == "upload":
-            handle_upload_request(call.message)
+            handle_upload_request(call.message, message_id)
         elif call.data == "my_bots":
-            handle_my_bots(call.message)
+            handle_my_bots(call.message, message_id)
         elif call.data == "deploy_new":
-            handle_deploy_new(call.message)
+            handle_deploy_new(call.message, message_id)
         elif call.data == "dashboard":
-            handle_dashboard(call.message)
+            handle_dashboard(call.message, message_id)
         elif call.data == "settings":
-            handle_settings(call.message)
+            handle_settings(call.message, message_id)
         elif call.data == "install_libs":
             ask_for_libraries(call)
         elif call.data == "cancel":
             clear_user_session(uid)
-            bot.edit_message_text("❌ Cancelled.", chat_id, message_id)
-            bot.send_message(chat_id, "🏠 **Main Menu**", reply_markup=get_main_keyboard(uid))
+            edit_or_send_message(chat_id, message_id, "❌ Cancelled.")
+            handle_commands(call.message)
         
         elif call.data.startswith("bot_"):
             bot_id = call.data.split("_")[1]
@@ -1180,6 +1307,11 @@ def callback_manager(call):
             bot_id = call.data.split("_")[1]
             confirm_delete_bot(call, bot_id)
         
+        elif call.data.startswith("confirm_delete_"):
+            parts = call.data.split("_")
+            bot_id = parts[2]
+            confirm_delete_action(call, bot_id)
+        
         elif call.data.startswith("export_"):
             bot_id = call.data.split("_")[1]
             export_bot(call, bot_id)
@@ -1188,10 +1320,9 @@ def callback_manager(call):
             bot_id = call.data.split("_")[1]
             show_bot_logs(call, bot_id)
         
-        # Admin callbacks
         elif call.data == "admin_panel":
             if uid == Config.ADMIN_ID:
-                handle_admin_panel(call.message)
+                handle_admin_panel(call.message, message_id)
             else:
                 bot.answer_callback_query(call.id, "⛔ Access Denied!")
         
@@ -1204,8 +1335,7 @@ def callback_manager(call):
             view_database_page(call, page_num)
         
         elif call.data == "back_main":
-            bot.edit_message_text("🏠 **Main Menu**", chat_id, message_id)
-            bot.send_message(chat_id, "Select an option:", reply_markup=get_main_keyboard(uid))
+            edit_or_send_message(chat_id, message_id, "🏠 **Main Menu**", reply_markup=get_main_keyboard(uid))
         
     except Exception as e:
         logger.error(f"Callback error: {e}")
@@ -1215,6 +1345,7 @@ def callback_manager(call):
 def start_deployment(call, file_id):
     uid = call.from_user.id
     chat_id = call.message.chat.id
+    message_id = call.message.message_id
     
     conn = get_db()
     c = conn.cursor()
@@ -1228,7 +1359,7 @@ def start_deployment(call, file_id):
     bot_id, bot_name, filename = bot_info
     
     # Check concurrent deployments
-    running_bots = len(get_user_bots(uid))
+    running_bots = sum(1 for b in get_user_bots(uid) if b['status'] == "Running")
     if running_bots >= Config.MAX_CONCURRENT_DEPLOYMENTS:
         bot.answer_callback_query(call.id, f"❌ Max {Config.MAX_CONCURRENT_DEPLOYMENTS} concurrent deployments allowed!")
         return
@@ -1247,13 +1378,16 @@ def start_deployment(call, file_id):
 🔄 **Status:** Starting...
 ━━━━━━━━━━━━━━━━━━━━
 """
-    bot.edit_message_text(text, chat_id, call.message.message_id)
+    edit_or_send_message(chat_id, message_id, text)
     
     try:
         file_path = project_path / filename
         start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         # Start process
+        logs_dir = Path('logs')
+        logs_dir.mkdir(exist_ok=True)
+        
         with open(f'logs/bot_{bot_id}.log', 'w') as log_file:
             proc = subprocess.Popen(
                 ['python', str(file_path)],
@@ -1284,11 +1418,11 @@ def start_deployment(call, file_id):
 🔧 **Status:** **RUNNING**
 ━━━━━━━━━━━━━━━━━━━━
 Bot is now active and running!
-        """
-        bot.edit_message_text(text, chat_id, call.message.message_id)
+"""
+        edit_or_send_message(chat_id, message_id, text)
         
         # Start monitoring
-        start_bot_monitoring(bot_id, proc.pid, chat_id, call.message.message_id)
+        start_bot_monitoring(bot_id, proc.pid, chat_id, message_id)
         
     except Exception as e:
         logger.error(f"Deployment error: {e}")
@@ -1298,8 +1432,8 @@ Bot is now active and running!
 Error: {str(e)}
 ━━━━━━━━━━━━━━━━━━━━
 Please check your bot code and try again.
-        """
-        bot.edit_message_text(text, chat_id, call.message.message_id)
+"""
+        edit_or_send_message(chat_id, message_id, text)
 
 def start_bot_monitoring(bot_id, pid, chat_id, message_id):
     """Start monitoring bot in background"""
@@ -1316,10 +1450,11 @@ def start_bot_monitoring(bot_id, pid, chat_id, message_id):
 
 def stop_bot(call, bot_id):
     uid = call.from_user.id
+    chat_id = call.message.chat.id
     
     conn = get_db()
     c = conn.cursor()
-    bot_info = c.execute("SELECT pid, node_id FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    bot_info = c.execute("SELECT pid, node_id, bot_name FROM deployments WHERE id=?", (bot_id,)).fetchone()
     
     if bot_info and bot_info['pid']:
         pid = bot_info['pid']
@@ -1340,11 +1475,12 @@ def stop_bot(call, bot_id):
     conn.commit()
     conn.close()
     
-    bot.answer_callback_query(call.id, "✅ Bot stopped successfully!")
+    bot.answer_callback_query(call.id, f"✅ {bot_info['bot_name']} stopped successfully!")
     show_bot_details(call, bot_id)
 
 def restart_bot(call, bot_id):
     uid = call.from_user.id
+    chat_id = call.message.chat.id
     
     # First stop
     conn = get_db()
@@ -1388,6 +1524,7 @@ def export_bot(call, bot_id):
             
             time.sleep(2)
             zip_path.unlink(missing_ok=True)
+            bot.answer_callback_query(call.id, "✅ Bot exported successfully!")
             
         except Exception as e:
             bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}")
@@ -1463,27 +1600,21 @@ def show_bot_logs(call, bot_id):
 {logs}
 ━━━━━━━━━━━━━━━━━━━━
 """
-        bot.answer_callback_query(call.id, "📜 Showing logs...")
         bot.send_message(call.message.chat.id, text)
+        bot.answer_callback_query(call.id, "📜 Logs sent!")
     except:
         bot.answer_callback_query(call.id, "❌ Error reading logs")
 
 def confirm_delete_bot(call, bot_id):
     conn = get_db()
     c = conn.cursor()
-    bot_info = c.execute("SELECT bot_name, filename, pid, node_id FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    bot_info = c.execute("SELECT bot_name, filename FROM deployments WHERE id=?", (bot_id,)).fetchone()
     conn.close()
     
     if not bot_info:
         return
     
-    bot_name, filename, pid, node_id = bot_info
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirmdel_{bot_id}"),
-        types.InlineKeyboardButton("❌ Cancel", callback_data=f"bot_{bot_id}")
-    )
+    bot_name, filename = bot_info
     
     text = f"""
 ⚠️ **CONFIRM DELETE**
@@ -1496,10 +1627,51 @@ Are you sure you want to delete?
 **This action cannot be undone!**
 ━━━━━━━━━━━━━━━━━━━━
 """
+    markup = get_yes_no_keyboard("delete", bot_id)
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
+def confirm_delete_action(call, bot_id):
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    
+    conn = get_db()
+    c = conn.cursor()
+    bot_info = c.execute("SELECT filename, pid, node_id FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    
+    if bot_info:
+        filename, pid, node_id = bot_info
+        
+        # Stop bot if running
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except:
+                pass
+        
+        # Delete file
+        file_path = project_path / filename
+        if file_path.exists():
+            file_path.unlink()
+        
+        # Update node load
+        if node_id:
+            c.execute("UPDATE nodes SET current_load=current_load-1 WHERE id=?", (node_id,))
+        
+        # Delete from database
+        c.execute("DELETE FROM deployments WHERE id=?", (bot_id,))
+        
+        # Update user bot count
+        update_user_bot_count(uid)
+        
+        conn.commit()
+    
+    conn.close()
+    
+    bot.answer_callback_query(call.id, "✅ Bot deleted successfully!")
+    handle_my_bots(call.message, call.message.message_id)
+
 def ask_for_libraries(call):
-    msg = bot.edit_message_text("""
+    text = """
 📚 **INSTALL LIBRARIES**
 ━━━━━━━━━━━━━━━━━━━━
 Enter library commands (one per line):
@@ -1513,85 +1685,78 @@ pip install beautifulsoup4
 ```
 ━━━━━━━━━━━━━━━━━━━━
 Type 'cancel' to abort.
-    """, call.message.chat.id, call.message.message_id)
+"""
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id)
     
     uid = call.from_user.id
     set_user_session(uid, {'state': 'waiting_for_libs'})
+    msg = bot.send_message(call.message.chat.id, "Please enter the library commands:")
+    update_message_history(uid, msg.message_id)
     bot.register_next_step_handler(msg, process_libraries_input)
 
-# Admin Functions
-def show_admin_panel(message):
-    text = """
-👑 **ADMIN CONTROL PANEL**
+def handle_activate_prime_callback(call):
+    uid = call.from_user.id
+    prime_status = check_prime_expiry(uid)
+    
+    if not prime_status['expired']:
+        text = f"""
+🔄 **RENEW PRIME (Early)**
 ━━━━━━━━━━━━━━━━━━━━
-Welcome to the admin dashboard.
-You can manage users, generate keys, and monitor system activities.
+Your Prime subscription is still active.
+Expires in: {prime_status['days_left']} days
+
+You can renew early with a new key:
+Format: `ZENX-XXXXXXXXXX`
 ━━━━━━━━━━━━━━━━━━━━
 """
-    bot.reply_to(message, text)
+    else:
+        text = """
+🔑 **ACTIVATE PRIME PASS**
+━━━━━━━━━━━━━━━━━━━━
+Enter your activation key below.
+Format: `ZENX-XXXXXXXXXX`
+━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    set_user_session(uid, {'state': 'waiting_for_key'})
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id)
+    msg = bot.send_message(call.message.chat.id, "Please enter your activation key:")
+    update_message_history(uid, msg.message_id)
+    bot.register_next_step_handler(msg, process_key_input)
 
-def gen_key_step1(call):
-    msg = bot.edit_message_text("""
+# Admin Functions
+def gen_key_step1_message(message, last_msg_id=None):
+    uid = message.from_user.id
+    set_user_session(uid, {'state': 'waiting_for_duration'})
+    
+    text = """
 🎫 **GENERATE PRIME KEY**
 ━━━━━━━━━━━━━━━━━━━━
 Step 1/3: Enter duration in days
 Example: 7, 30, 90, 365
 ━━━━━━━━━━━━━━━━━━━━
-    """, call.message.chat.id, call.message.message_id)
-    bot.register_next_step_handler(msg, gen_key_step2)
+Type 'cancel' to abort.
+"""
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
-def gen_key_step2(message):
-    try:
-        days = int(message.text.strip())
-        if days <= 0:
-            raise ValueError
-        bot.delete_message(message.chat.id, message.message_id)
-        msg = bot.send_message(message.chat.id, f"""
+def gen_key_step1(call):
+    uid = call.from_user.id
+    set_user_session(uid, {'state': 'waiting_for_duration'})
+    
+    text = """
 🎫 **GENERATE PRIME KEY**
 ━━━━━━━━━━━━━━━━━━━━
-Step 2/3: Duration set to **{days} days**
-
-Now enter file access limit
-Example: 3, 5, 10
+Step 1/3: Enter duration in days
+Example: 7, 30, 90, 365
 ━━━━━━━━━━━━━━━━━━━━
-        """)
-        bot.register_next_step_handler(msg, gen_key_step3, days)
-    except:
-        bot.send_message(message.chat.id, "❌ Invalid input! Please enter a valid number.")
+Type 'cancel' to abort.
+"""
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id)
+    msg = bot.send_message(call.message.chat.id, "Please enter duration in days:")
+    update_message_history(uid, msg.message_id)
+    bot.register_next_step_handler(msg, process_duration_input)
 
-def gen_key_step3(message, days):
-    try:
-        limit = int(message.text.strip())
-        if limit <= 0:
-            raise ValueError
-        bot.delete_message(message.chat.id, message.message_id)
-        
-        key = generate_random_key()
-        created_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("INSERT INTO keys (key, duration_days, file_limit, created_date) VALUES (?, ?, ?, ?)", 
-                 (key, days, limit, created_date))
-        conn.commit()
-        conn.close()
-        
-        response = f"""
-✅ **KEY GENERATED SUCCESSFULLY**
-━━━━━━━━━━━━━━━━━━━━
-🔑 **Key:** `{key}`
-⏰ **Duration:** {days} days
-📦 **File Limit:** {limit} files
-📅 **Created:** {created_date}
-━━━━━━━━━━━━━━━━━━━━
-Share this key with the user.
-        """
-        bot.send_message(message.chat.id, response)
-        
-    except:
-        bot.send_message(message.chat.id, "❌ Invalid input!")
-
-def show_all_users_admin(message):
+def show_all_users_admin(message, last_msg_id=None):
     conn = get_db()
     c = conn.cursor()
     users = c.execute("SELECT id, username, expiry, file_limit, is_prime, join_date FROM users").fetchall()
@@ -1617,9 +1782,9 @@ def show_all_users_admin(message):
     if len(users) > 15:
         text += f"\n\n... and {len(users) - 15} more users"
     
-    bot.reply_to(message, text)
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
-def show_all_bots_admin(message):
+def show_all_bots_admin(message, last_msg_id=None):
     conn = get_db()
     c = conn.cursor()
     bots = c.execute("SELECT d.id, d.bot_name, d.status, d.start_time, u.username FROM deployments d LEFT JOIN users u ON d.user_id = u.id ORDER BY d.id DESC LIMIT 20").fetchall()
@@ -1642,9 +1807,9 @@ def show_all_bots_admin(message):
             username = bot_info['username'] if bot_info['username'] else "Unknown"
             text += f"\n• {bot_info['bot_name']} (User: @{username}) - {bot_info['status']}"
     
-    bot.reply_to(message, text)
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
-def show_admin_stats(message):
+def show_admin_stats(message, last_msg_id=None):
     conn = get_db()
     c = conn.cursor()
     
@@ -1689,12 +1854,12 @@ def show_admin_stats(message):
 • Bot: @{Config.BOT_USERNAME}
 ━━━━━━━━━━━━━━━━━━━━
 """
-    bot.reply_to(message, text)
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
-def view_database_admin(message):
-    view_database_page_admin(message, 1)
+def view_database_admin(message, last_msg_id=None):
+    view_database_page_admin(message, 1, last_msg_id)
 
-def view_database_page_admin(message, page_num):
+def view_database_page_admin(message, page_num, last_msg_id=None):
     items_per_page = 5
     offset = (page_num - 1) * items_per_page
     
@@ -1745,9 +1910,9 @@ def view_database_page_admin(message, page_num):
     if row_buttons:
         markup.row(*row_buttons)
     
-    bot.reply_to(message, text, reply_markup=markup)
+    edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
 
-def backup_database_admin(message):
+def backup_database_admin(message, last_msg_id=None):
     try:
         backup_dir = Path('backups')
         backup_dir.mkdir(exist_ok=True)
@@ -1766,10 +1931,12 @@ def backup_database_admin(message):
         time.sleep(2)
         backup_path.unlink(missing_ok=True)
         
+        edit_or_send_message(message.chat.id, last_msg_id, "✅ Backup created and sent successfully!")
+        
     except Exception as e:
-        bot.reply_to(message, f"❌ Backup failed: {str(e)}")
+        edit_or_send_message(message.chat.id, last_msg_id, f"❌ Backup failed: {str(e)}")
 
-def toggle_maintenance_admin(message):
+def toggle_maintenance_admin(message, last_msg_id=None):
     global Config
     Config.MAINTENANCE = not Config.MAINTENANCE
     
@@ -1783,9 +1950,9 @@ Maintenance mode has been {'enabled' if Config.MAINTENANCE else 'disabled'}.
 Only admin can access the system when enabled.
 ━━━━━━━━━━━━━━━━━━━━
 """
-    bot.reply_to(message, text)
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
-def show_nodes_status(message):
+def show_nodes_status(message, last_msg_id=None):
     conn = get_db()
     c = conn.cursor()
     nodes = c.execute("SELECT * FROM nodes").fetchall()
@@ -1797,7 +1964,7 @@ def show_nodes_status(message):
 """
     
     for node in nodes:
-        load_percent = (node['current_load'] / node['capacity']) * 100
+        load_percent = (node['current_load'] / node['capacity']) * 100 if node['capacity'] > 0 else 0
         load_bar = create_progress_bar(load_percent)
         status_icon = "🟢" if node['status'] == 'active' else "🔴"
         
@@ -1808,7 +1975,7 @@ def show_nodes_status(message):
         text += f"\n• Last Check: {node['last_check']}"
         text += "\n━━━━━━━━━━━━━━━━━━━━\n"
     
-    bot.reply_to(message, text)
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
 # Helper Functions
 def calculate_uptime(start_time_str):
@@ -1850,34 +2017,6 @@ def extract_zip_file(zip_path, extract_to):
     except Exception as e:
         logger.error(f"Error extracting zip: {e}")
         return False
-
-def handle_activate_prime_callback(call):
-    uid = call.from_user.id
-    prime_status = check_prime_expiry(uid)
-    
-    if not prime_status['expired']:
-        text = f"""
-🔄 **RENEW PRIME (Early)**
-━━━━━━━━━━━━━━━━━━━━
-Your Prime subscription is still active.
-Expires in: {prime_status['days_left']} days
-
-You can renew early with a new key:
-Format: `ZENX-XXXXXXXXXX`
-━━━━━━━━━━━━━━━━━━━━
-        """
-    else:
-        text = """
-🔑 **ACTIVATE PRIME PASS**
-━━━━━━━━━━━━━━━━━━━━
-Enter your activation key below.
-Format: `ZENX-XXXXXXXXXX`
-━━━━━━━━━━━━━━━━━━━━
-        """
-    
-    set_user_session(uid, {'state': 'waiting_for_key'})
-    msg = bot.send_message(call.message.chat.id, text)
-    bot.register_next_step_handler(msg, process_key_input)
 
 # Flask Routes for Render
 @app.route('/')
