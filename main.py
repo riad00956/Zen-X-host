@@ -331,13 +331,13 @@ def get_main_keyboard(user_id):
             "🚀 Deploy Bot",
             "📊 Dashboard",
             "⚙️ Settings",
-            "💎 Premium Info"
+            "👑 Prime Info"
         ]
     else:
         # Prime expired or not active
         buttons = [
             "🔑 Activate Prime",
-            "💎 Premium Info",
+            "👑 Prime Info",
             "📞 Contact Admin",
             "ℹ️ Help"
         ]
@@ -455,11 +455,11 @@ def handle_commands(message):
     else:
         status = "PRIME 👑"
         expiry_msg = f"{prime_status['days_left']} days left"
-        plan = "Premium"
+        plan = "Prime"
     
     text = f"""
 🤖 **ZEN X HOST BOT v3.2.0**
-*300-Capacity Multi-Node Hosting System*
+dev:@zerox6t9 | sub:@rifatbro22
 ━━━━━━━━━━━━━━━━━━━━
 👤 **User:** @{username}
 🆔 **ID:** `{uid}`
@@ -536,7 +536,7 @@ def handle_main_menu_buttons(message):
         handle_dashboard(message, last_msg_id)
     elif text == "⚙️ Settings":
         handle_settings(message, last_msg_id)
-    elif text == "💎 Premium Info":
+    elif text == "👑 Prime Info":
         handle_premium_info(message, last_msg_id)
     elif text == "🔑 Activate Prime":
         handle_activate_prime(message, last_msg_id)
@@ -708,7 +708,7 @@ def handle_dashboard(message, last_msg_id=None):
 • Capacity: {used_capacity}/{total_capacity} bots
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Platform:**
-• Platform: ZEN X 300-CAPACITY NODES
+• Platform: ZEN X HOSTING 
 • Type: Web Service
 • Max Concurrent: {Config.MAX_CONCURRENT_DEPLOYMENTS}
 • Region: Asia → Bangladesh 🇧🇩
@@ -759,7 +759,7 @@ def handle_settings(message, last_msg_id=None):
 
 def handle_premium_info(message, last_msg_id=None):
     text = f"""
-👑 **PREMIUM FEATURES**
+👑 **PRIME FEATURES**
 ━━━━━━━━━━━━━━━━━━━━
 ✅ **300-Capacity Node Hosting**
 ✅ **Priority Support**
@@ -778,10 +778,10 @@ def handle_premium_info(message, last_msg_id=None):
 Contact: @{Config.ADMIN_USERNAME}
 ━━━━━━━━━━━━━━━━━━━━
 💰 **Pricing:**
-• 7 Days: ৳50
-• 30 Days: ৳150
-• 90 Days: ৳400
-• 365 Days: ৳1200
+• 7 Days: ৳15
+• 30 Days: ৳25
+• 90 Days: ৳45
+• 365 Days: ৳125
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1133,7 +1133,7 @@ def process_key_input(message):
 ⏰ **Duration Added:** {days} days
 🔄 **Last Renewal:** {last_renewal}
 ━━━━━━━━━━━━━━━━━━━━
-Enjoy all premium features!
+Enjoy all prime features!
         """
         
         clear_user_session(uid)
@@ -1865,9 +1865,9 @@ def show_admin_stats(message, last_msg_id=None):
 • Disk Usage: {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Info:**
-• Platform: ZEN X HOST v3.2.0
+• Platform: ZEN X HOST v3.2.7
 • Port: {Config.PORT}
-• Nodes: {len(Config.HOSTING_NODES)} x 300 capacity
+• Nodes: {len(Config.HOSTING_NODES)} x 900 capacity
 • Total Capacity: {total_capacity} bots
 • Used Capacity: {running_bots} bots
 • Available: {available_capacity} bots
