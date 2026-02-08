@@ -21,7 +21,14 @@ from flask import Flask, render_template_string, send_file, Response, jsonify
 from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('zenx_bot.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Global variable to track if bot is running
@@ -33,17 +40,25 @@ class Config:
     ADMIN_ID = int(os.environ.get('ADMIN_ID', 7832264582))
     PROJECT_DIR = 'projects'
     DB_NAME = 'cyber_v2.db'
+    BACKUP_DIR = 'backups'
+    LOGS_DIR = 'logs'
+    EXPORTS_DIR = 'exports'
     PORT = int(os.environ.get('PORT', 10000))
     MAINTENANCE = False
     ADMIN_USERNAME = 'zerox6t9'
     BOT_USERNAME = 'zen_xbot'
     MAX_BOTS_PER_USER = 5
     MAX_CONCURRENT_DEPLOYMENTS = 4
+    AUTO_RESTART_BOTS = True  # Auto restart bots on server restart
+    BACKUP_INTERVAL = 3600  # Backup every hour in seconds
+    BOT_TIMEOUT = 300  # 5 minutes timeout for bot startup
+    MAX_LOG_SIZE = 10000  # Max 10KB per log file
+    
     # Updated to 300 capacity nodes
     HOSTING_NODES = [
-        {"name": "Node-1", "status": "active", "capacity": 300},
-        {"name": "Node-2", "status": "active", "capacity": 300},
-        {"name": "Node-3", "status": "active", "capacity": 300}
+        {"name": "Node-1", "status": "active", "capacity": 300, "region": "Asia"},
+        {"name": "Node-2", "status": "active", "capacity": 300, "region": "Asia"},
+        {"name": "Node-3", "status": "active", "capacity": 300, "region": "Europe"}
     ]
 
 bot = telebot.TeleBot(Config.TOKEN, parse_mode="Markdown")
@@ -57,50 +72,222 @@ executor = ThreadPoolExecutor(max_workers=10)
 # User session management
 user_sessions = {}
 user_message_history = {}
+bot_monitors = {}  # Store bot monitoring threads
 
-# ২. Enhanced Database Functions
+# ২. Enhanced Database Functions with Auto-Recovery
 def init_db():
-    conn = sqlite3.connect(Config.DB_NAME)
-    c = conn.cursor()
+    """Initialize database with recovery support"""
+    try:
+        # Check if database exists
+        db_exists = os.path.exists(Config.DB_NAME)
+        
+        conn = sqlite3.connect(Config.DB_NAME)
+        c = conn.cursor()
+        
+        # Create tables if they don't exist
+        c.execute('''CREATE TABLE IF NOT EXISTS users 
+                    (id INTEGER PRIMARY KEY, username TEXT, expiry TEXT, file_limit INTEGER, 
+                     is_prime INTEGER, join_date TEXT, last_renewal TEXT, total_bots_deployed INTEGER DEFAULT 0,
+                     total_deployments INTEGER DEFAULT 0, last_active TEXT)''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS keys 
+                    (key TEXT PRIMARY KEY, duration_days INTEGER, file_limit INTEGER, created_date TEXT, 
+                     used_by TEXT, used_date TEXT, is_used INTEGER DEFAULT 0)''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS deployments 
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, bot_name TEXT, 
+                     filename TEXT, pid INTEGER, start_time TEXT, status TEXT, 
+                     cpu_usage REAL, ram_usage REAL, last_active TEXT, node_id INTEGER,
+                     logs TEXT, restart_count INTEGER DEFAULT 0, auto_restart INTEGER DEFAULT 1,
+                     created_at TEXT, updated_at TEXT)''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS nodes
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, status TEXT, 
+                     capacity INTEGER, current_load INTEGER DEFAULT 0, last_check TEXT,
+                     region TEXT, total_deployed INTEGER DEFAULT 0)''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS server_logs
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, 
+                     event TEXT, details TEXT, user_id INTEGER)''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS bot_logs
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER, timestamp TEXT,
+                     log_type TEXT, message TEXT)''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS notifications
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, message TEXT,
+                     is_read INTEGER DEFAULT 0, created_at TEXT)''')
+        
+        # Check if admin exists
+        c.execute("SELECT * FROM users WHERE id=?", (Config.ADMIN_ID,))
+        admin_exists = c.fetchone()
+        
+        if not admin_exists:
+            # Insert admin user
+            join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            expiry_date = (datetime.now() + timedelta(days=3650)).strftime('%Y-%m-%d %H:%M:%S')
+            c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
+                     (Config.ADMIN_ID, 'admin', expiry_date, 100, 1, join_date, join_date, 0, 0, join_date))
+            log_event("INIT", f"Admin user created: {Config.ADMIN_ID}", Config.ADMIN_ID)
+        
+        # Check if nodes exist
+        c.execute("SELECT COUNT(*) FROM nodes")
+        node_count = c.fetchone()[0]
+        
+        if node_count == 0:
+            # Initialize hosting nodes with 300 capacity
+            join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            for i, node in enumerate(Config.HOSTING_NODES, 1):
+                c.execute("INSERT INTO nodes (name, status, capacity, last_check, region) VALUES (?, ?, ?, ?, ?)",
+                         (node['name'], node['status'], node['capacity'], join_date, node.get('region', 'Global')))
+            log_event("INIT", f"Created {len(Config.HOSTING_NODES)} hosting nodes", Config.ADMIN_ID)
+        
+        # Update all running bots to "Stopped" status for recovery
+        if db_exists:
+            c.execute("UPDATE deployments SET status='Stopped', pid=0, updated_at=? WHERE status='Running'",
+                     (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),))
+            log_event("RECOVERY", "Reset all running bots for recovery", Config.ADMIN_ID)
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info("Database initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+
+def recover_deployments():
+    """Recover previously running bots on server restart"""
+    if not Config.AUTO_RESTART_BOTS:
+        return
     
-    # Drop old tables if they exist
-    c.execute("DROP TABLE IF EXISTS users")
-    c.execute("DROP TABLE IF EXISTS keys")
-    c.execute("DROP TABLE IF EXISTS deployments")
-    c.execute("DROP TABLE IF EXISTS nodes")
-    
-    # Create new tables with enhanced structure
-    c.execute('''CREATE TABLE users 
-                (id INTEGER PRIMARY KEY, username TEXT, expiry TEXT, file_limit INTEGER, 
-                 is_prime INTEGER, join_date TEXT, last_renewal TEXT, total_bots_deployed INTEGER DEFAULT 0)''')
-    
-    c.execute('''CREATE TABLE keys 
-                (key TEXT PRIMARY KEY, duration_days INTEGER, file_limit INTEGER, created_date TEXT, 
-                 used_by TEXT, used_date TEXT)''')
-    
-    c.execute('''CREATE TABLE deployments 
-                (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, bot_name TEXT, 
-                 filename TEXT, pid INTEGER, start_time TEXT, status TEXT, 
-                 cpu_usage REAL, ram_usage REAL, last_active TEXT, node_id INTEGER,
-                 logs TEXT, restart_count INTEGER DEFAULT 0)''')
-    
-    c.execute('''CREATE TABLE nodes
-                (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, status TEXT, 
-                 capacity INTEGER, current_load INTEGER DEFAULT 0, last_check TEXT)''')
-    
-    # Insert admin user
-    join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    expiry_date = (datetime.now() + timedelta(days=3650)).strftime('%Y-%m-%d %H:%M:%S')
-    c.execute("INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
-             (Config.ADMIN_ID, 'admin', expiry_date, 100, 1, join_date, join_date, 0))
-    
-    # Initialize hosting nodes with 300 capacity
-    for i, node in enumerate(Config.HOSTING_NODES, 1):
-        c.execute("INSERT INTO nodes (name, status, capacity, last_check) VALUES (?, ?, ?, ?)",
-                 (node['name'], node['status'], node['capacity'], join_date))
-    
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        
+        # Get all bots that were running before restart
+        running_bots = c.execute("""
+            SELECT d.*, u.username 
+            FROM deployments d 
+            LEFT JOIN users u ON d.user_id = u.id 
+            WHERE d.auto_restart = 1 AND d.status IN ('Running', 'Restarting')
+        """).fetchall()
+        
+        conn.close()
+        
+        if not running_bots:
+            return
+        
+        logger.info(f"Found {len(running_bots)} bots to recover")
+        
+        for bot_info in running_bots:
+            bot_id = bot_info['id']
+            user_id = bot_info['user_id']
+            bot_name = bot_info['bot_name']
+            filename = bot_info['filename']
+            username = bot_info['username'] or f"User_{user_id}"
+            
+            # Check if bot file exists
+            file_path = project_path / filename
+            if not file_path.exists():
+                logger.error(f"Bot file not found for recovery: {filename}")
+                log_event("RECOVERY_ERROR", f"Bot file not found: {filename}", user_id)
+                continue
+            
+            # Assign to node
+            node = assign_bot_to_node(user_id, bot_name)
+            if not node:
+                logger.error(f"No available nodes for bot {bot_id}")
+                continue
+            
+            try:
+                # Start the bot
+                start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                logs_dir = Path('logs')
+                logs_dir.mkdir(exist_ok=True)
+                
+                with open(f'logs/bot_{bot_id}.log', 'a') as log_file:
+                    log_file.write(f"\n{'='*50}\nAuto-Recovery started at {start_time}\n{'='*50}\n")
+                    proc = subprocess.Popen(
+                        ['python', str(file_path)],
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True
+                    )
+                
+                # Update database
+                conn = get_db()
+                c = conn.cursor()
+                c.execute("""
+                    UPDATE deployments 
+                    SET pid=?, start_time=?, status='Running', node_id=?, last_active=?, 
+                    restart_count=restart_count+1, updated_at=? 
+                    WHERE id=?
+                """, (proc.pid, start_time, node['id'], start_time, start_time, bot_id))
+                
+                c.execute("UPDATE nodes SET current_load=current_load+1, total_deployed=total_deployed+1 WHERE id=?", (node['id'],))
+                conn.commit()
+                conn.close()
+                
+                logger.info(f"Recovered bot {bot_name} (ID: {bot_id}) for user {username}")
+                log_event("RECOVERY_SUCCESS", f"Bot {bot_name} recovered successfully", user_id)
+                
+                # Start monitoring
+                start_bot_monitoring(bot_id, proc.pid, user_id)
+                
+            except Exception as e:
+                logger.error(f"Failed to recover bot {bot_id}: {e}")
+                log_event("RECOVERY_FAILED", f"Failed to recover bot {bot_id}: {str(e)[:100]}", user_id)
+        
+        log_event("RECOVERY_COMPLETE", f"Successfully recovered {len(running_bots)} bots", Config.ADMIN_ID)
+        
+    except Exception as e:
+        logger.error(f"Error in deployment recovery: {e}")
+
+def log_event(event, details, user_id=None):
+    """Log server events"""
+    try:
+        conn = sqlite3.connect(Config.DB_NAME)
+        c = conn.cursor()
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        c.execute("INSERT INTO server_logs (timestamp, event, details, user_id) VALUES (?, ?, ?, ?)",
+                 (timestamp, event, details, user_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error logging event: {e}")
+
+def log_bot_event(bot_id, log_type, message):
+    """Log bot events"""
+    try:
+        conn = sqlite3.connect(Config.DB_NAME)
+        c = conn.cursor()
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        c.execute("INSERT INTO bot_logs (bot_id, timestamp, log_type, message) VALUES (?, ?, ?, ?)",
+                 (bot_id, timestamp, log_type, message))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error logging bot event: {e}")
+
+def send_notification(user_id, message):
+    """Send notification to user"""
+    try:
+        conn = sqlite3.connect(Config.DB_NAME)
+        c = conn.cursor()
+        created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        c.execute("INSERT INTO notifications (user_id, message, created_at) VALUES (?, ?, ?)",
+                 (user_id, message, created_at))
+        conn.commit()
+        conn.close()
+        
+        # Send immediate notification via Telegram if bot is active
+        try:
+            bot.send_message(user_id, f"📢 **Notification:** {message}")
+        except:
+            pass
+    except Exception as e:
+        logger.error(f"Error sending notification: {e}")
 
 # Initialize database
 init_db()
@@ -109,6 +296,60 @@ def get_db():
     conn = sqlite3.connect(Config.DB_NAME)
     conn.row_factory = sqlite3.Row
     return conn
+
+# Backup Functions
+def backup_database():
+    """Create a backup of the database"""
+    try:
+        backup_dir = Path(Config.BACKUP_DIR)
+        backup_dir.mkdir(exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_filename = f"zenx_backup_{timestamp}.db"
+        backup_path = backup_dir / backup_filename
+        
+        # Copy database file
+        import shutil
+        shutil.copy2(Config.DB_NAME, backup_path)
+        
+        # Compress backup
+        zip_filename = f"zenx_backup_{timestamp}.zip"
+        zip_path = backup_dir / zip_filename
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(backup_path, arcname=backup_filename)
+        
+        # Remove uncompressed backup
+        backup_path.unlink(missing_ok=True)
+        
+        # Clean old backups (keep last 7 days)
+        for file in backup_dir.glob("zenx_backup_*.zip"):
+            file_time_str = file.stem.split('_')[-1]
+            try:
+                file_time = datetime.strptime(file_time_str, '%Y%m%d%H%M%S')
+                if (datetime.now() - file_time).days > 7:
+                    file.unlink()
+            except:
+                pass
+        
+        logger.info(f"Database backup created: {zip_filename}")
+        log_event("BACKUP_CREATED", f"Backup created: {zip_filename}", Config.ADMIN_ID)
+        return zip_path
+        
+    except Exception as e:
+        logger.error(f"Backup failed: {e}")
+        return None
+
+def schedule_backups():
+    """Schedule regular database backups"""
+    while True:
+        time.sleep(Config.BACKUP_INTERVAL)
+        try:
+            backup_path = backup_database()
+            if backup_path:
+                logger.info(f"Scheduled backup completed: {backup_path.name}")
+        except Exception as e:
+            logger.error(f"Scheduled backup error: {e}")
 
 # System Monitoring Functions
 def get_system_stats():
@@ -119,6 +360,16 @@ def get_system_stats():
     total_bots = c.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
     running_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE status='Running'").fetchone()[0]
     total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    active_users = c.execute("SELECT COUNT(DISTINCT user_id) FROM deployments WHERE status='Running'").fetchone()[0]
+    
+    # Get last backup info
+    backup_dir = Path(Config.BACKUP_DIR)
+    backup_files = list(backup_dir.glob("zenx_backup_*.zip"))
+    last_backup = backup_files[-1].stat().st_mtime if backup_files else None
+    
+    # Get total deployed today
+    today = datetime.now().strftime('%Y-%m-%d')
+    deployed_today = c.execute("SELECT COUNT(*) FROM deployments WHERE DATE(created_at)=?", (today,)).fetchone()[0]
     
     conn.close()
     
@@ -127,11 +378,17 @@ def get_system_stats():
         'ram_percent': random.randint(15, 60),
         'disk_percent': random.randint(20, 70),
         'total_users': total_users,
+        'active_users': active_users,
         'total_bots': total_bots,
         'running_bots': running_bots,
+        'deployed_today': deployed_today,
         'uptime_days': random.randint(1, 365),
         'total_capacity': len(Config.HOSTING_NODES) * 300,
-        'available_capacity': (len(Config.HOSTING_NODES) * 300) - running_bots
+        'available_capacity': (len(Config.HOSTING_NODES) * 300) - running_bots,
+        'last_backup': datetime.fromtimestamp(last_backup).strftime('%Y-%m-%d %H:%M:%S') if last_backup else "Never",
+        'backup_count': len(backup_files),
+        'platform': platform.system(),
+        'python_version': platform.python_version()
     }
     return stats
 
@@ -175,7 +432,9 @@ def update_user_bot_count(user_id):
     conn = get_db()
     c = conn.cursor()
     count = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=?", (user_id,)).fetchone()[0]
-    c.execute("UPDATE users SET total_bots_deployed=? WHERE id=?", (count, user_id))
+    deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (user_id,)).fetchone()[0]
+    c.execute("UPDATE users SET total_bots_deployed=?, total_deployments=total_deployments+1 WHERE id=?", 
+              (count, user_id))
     conn.commit()
     conn.close()
 
@@ -192,8 +451,13 @@ def is_prime(user_id):
 def get_user_bots(user_id):
     conn = get_db()
     c = conn.cursor()
-    bots = c.execute("SELECT id, bot_name, filename, pid, start_time, status, node_id, restart_count FROM deployments WHERE user_id=?", 
-                    (user_id,)).fetchall()
+    bots = c.execute("""
+        SELECT id, bot_name, filename, pid, start_time, status, node_id, 
+               restart_count, auto_restart, created_at 
+        FROM deployments 
+        WHERE user_id=? 
+        ORDER BY status DESC, id DESC
+    """, (user_id,)).fetchall()
     conn.close()
     return bots
 
@@ -201,8 +465,8 @@ def update_bot_stats(bot_id, cpu, ram):
     conn = get_db()
     c = conn.cursor()
     last_active = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    c.execute("UPDATE deployments SET cpu_usage=?, ram_usage=?, last_active=? WHERE id=?", 
-             (cpu, ram, last_active, bot_id))
+    c.execute("UPDATE deployments SET cpu_usage=?, ram_usage=?, last_active=?, updated_at=? WHERE id=?", 
+             (cpu, ram, last_active, last_active, bot_id))
     conn.commit()
     conn.close()
 
@@ -220,7 +484,7 @@ def create_zip_file(bot_id, bot_name, filename, user_id):
     """Create a zip file for bot export"""
     try:
         # Create export directory if not exists
-        export_dir = Path('exports')
+        export_dir = Path(Config.EXPORTS_DIR)
         export_dir.mkdir(exist_ok=True)
         
         # Create zip file
@@ -240,9 +504,11 @@ def create_zip_file(bot_id, bot_name, filename, user_id):
                 'filename': filename,
                 'user_id': user_id,
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': 'ZEN X HOST BOT v3.2.0',
+                'version': 'ZEN X HOST BOT v3.3.0',
                 'exported_by': 'ZEN X Bot Hosting System',
-                'node_info': '300-Capacity Multi-Node Hosting'
+                'node_info': '300-Capacity Multi-Node Hosting',
+                'recovery_info': 'Auto-recovery enabled',
+                'requirements': get_bot_requirements(bot_file_path)
             }
             
             # Create metadata file in zip
@@ -253,6 +519,28 @@ def create_zip_file(bot_id, bot_name, filename, user_id):
     except Exception as e:
         logger.error(f"Error creating zip: {e}")
         return None
+
+def get_bot_requirements(file_path):
+    """Extract requirements from bot file"""
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            
+        requirements = []
+        lines = content.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if line.startswith('import ') or line.startswith('from '):
+                parts = line.split()
+                if len(parts) >= 2:
+                    module = parts[1].split('.')[0]
+                    if module not in requirements and module not in ['sys', 'os', 'time', 'datetime', 'json', 'random']:
+                        requirements.append(module)
+        
+        return requirements[:10]  # Return top 10 requirements
+    except:
+        return []
 
 def check_prime_expiry(user_id):
     """Check if prime has expired and return appropriate message"""
@@ -331,7 +619,9 @@ def get_main_keyboard(user_id):
             "🚀 Deploy Bot",
             "📊 Dashboard",
             "⚙️ Settings",
-            "👑 Prime Info"
+            "👑 Prime Info",
+            "🔔 Notifications",
+            "📈 Statistics"
         ]
     else:
         # Prime expired or not active
@@ -339,7 +629,8 @@ def get_main_keyboard(user_id):
             "🔑 Activate Prime",
             "👑 Prime Info",
             "📞 Contact Admin",
-            "ℹ️ Help"
+            "ℹ️ Help",
+            "📊 Free Dashboard"
         ]
     
     # Arrange buttons in rows of 2
@@ -364,7 +655,11 @@ def get_admin_keyboard():
         "🗄️ View Database",
         "💾 Backup DB",
         "⚙️ Maintenance",
-        "🌐 Nodes Status"
+        "🌐 Nodes Status",
+        "🔧 Server Logs",
+        "📊 System Info",
+        "🔔 Broadcast",
+        "🔄 Cleanup"
     ]
     
     for i in range(0, len(buttons), 2):
@@ -382,8 +677,10 @@ def get_bot_actions_keyboard(bot_id):
         types.InlineKeyboardButton("🔄 Restart", callback_data=f"restart_{bot_id}"),
         types.InlineKeyboardButton("📥 Export", callback_data=f"export_{bot_id}"),
         types.InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{bot_id}"),
-        types.InlineKeyboardButton("📜 Logs", callback_data=f"logs_{bot_id}")
+        types.InlineKeyboardButton("📜 Logs", callback_data=f"logs_{bot_id}"),
+        types.InlineKeyboardButton("🔁 Auto-Restart", callback_data=f"autorestart_{bot_id}")
     )
+    markup.add(types.InlineKeyboardButton("📊 Stats", callback_data=f"stats_{bot_id}"))
     markup.add(types.InlineKeyboardButton("🔙 Back to Bots", callback_data="my_bots"))
     return markup
 
@@ -391,7 +688,7 @@ def get_file_selection_keyboard(files):
     """Get file selection inline keyboard"""
     markup = types.InlineKeyboardMarkup(row_width=1)
     for file_id, filename, bot_name in files:
-        markup.add(types.InlineKeyboardButton(f"📁 {bot_name}", callback_data=f"select_{file_id}"))
+        markup.add(types.InlineKeyboardButton(f"📁 {bot_name} ({filename})", callback_data=f"select_{file_id}"))
     markup.add(types.InlineKeyboardButton("🔙 Cancel", callback_data="cancel"))
     return markup
 
@@ -401,6 +698,17 @@ def get_yes_no_keyboard(action, bot_id):
     markup.add(
         types.InlineKeyboardButton("✅ Yes", callback_data=f"confirm_{action}_{bot_id}"),
         types.InlineKeyboardButton("❌ No", callback_data=f"bot_{bot_id}")
+    )
+    return markup
+
+def get_stats_keyboard():
+    """Get statistics keyboard"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📊 Today", callback_data="stats_today"),
+        types.InlineKeyboardButton("📈 Weekly", callback_data="stats_weekly"),
+        types.InlineKeyboardButton("📅 Monthly", callback_data="stats_monthly"),
+        types.InlineKeyboardButton("👤 User Stats", callback_data="stats_user")
     )
     return markup
 
@@ -437,8 +745,8 @@ def handle_commands(message):
         conn = get_db()
         c = conn.cursor()
         join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute("INSERT OR IGNORE INTO users (id, username, expiry, file_limit, is_prime, join_date, last_renewal) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                 (uid, username, None, 1, 0, join_date, None))
+        c.execute("INSERT OR IGNORE INTO users (id, username, expiry, file_limit, is_prime, join_date, last_renewal, last_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
+                 (uid, username, None, 1, 0, join_date, None, join_date))
         conn.commit()
         conn.close()
         user = get_user(uid)
@@ -457,20 +765,30 @@ def handle_commands(message):
         expiry_msg = f"{prime_status['days_left']} days left"
         plan = "Prime"
     
+    # Check for notifications
+    conn = get_db()
+    c = conn.cursor()
+    unread_notifications = c.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (uid,)).fetchone()[0]
+    conn.close()
+    
+    notification_badge = f" ({unread_notifications})" if unread_notifications > 0 else ""
+    
     text = f"""
-🤖 **ZEN X HOST BOT v3.2.0**
-dev:@zerox6t9 | sub:@rifatbro22
+🤖 **ZEN X HOST BOT v3.3.0**
+*Auto-Recovery System Enabled*
 ━━━━━━━━━━━━━━━━━━━━
 👤 **User:** @{username}
 🆔 **ID:** `{uid}`
 💎 **Status:** {status}
 📅 **Join Date:** {user['join_date']}
+🔔 **Notifications:** {unread_notifications} unread
 ━━━━━━━━━━━━━━━━━━━━
 📊 **Account Details:**
 • Plan: {plan}
 • File Limit: `{user['file_limit']}` files
 • Expiry: {expiry_msg}
 • Total Bots: {user['total_bots_deployed'] or 0}
+• Total Deployments: {user['total_deployments'] or 0}
 ━━━━━━━━━━━━━━━━━━━━
 💡 *Use keyboard buttons below:*
 """
@@ -485,7 +803,9 @@ def handle_admin(message):
         set_user_session(uid, {'state': 'admin_panel'})
         cleanup_old_messages(uid)
         text = """
-👑 **ADMIN CONTROL PANEL**
+👑 **ADMIN CONTROL PANEL v3.3.0**
+━━━━━━━━━━━━━━━━━━━━
+*Auto-Recovery System: ACTIVE*
 ━━━━━━━━━━━━━━━━━━━━
 Welcome to the admin dashboard.
 Select an option from the keyboard below:
@@ -514,6 +834,12 @@ def handle_text_messages(message):
         process_duration_input(message)
     elif session.get('state') == 'waiting_for_limit':
         process_limit_input(message)
+    elif session.get('state') == 'waiting_for_logs_count':
+        process_logs_count(message)
+    elif session.get('state') == 'waiting_for_broadcast':
+        process_broadcast_message(message)
+    elif session.get('state') == 'waiting_for_user_id':
+        process_user_id_input(message)
     else:
         # Handle main menu buttons
         handle_main_menu_buttons(message)
@@ -534,6 +860,8 @@ def handle_main_menu_buttons(message):
         handle_deploy_new(message, last_msg_id)
     elif text == "📊 Dashboard":
         handle_dashboard(message, last_msg_id)
+    elif text == "📊 Free Dashboard":
+        handle_dashboard(message, last_msg_id)
     elif text == "⚙️ Settings":
         handle_settings(message, last_msg_id)
     elif text == "👑 Prime Info":
@@ -544,12 +872,17 @@ def handle_main_menu_buttons(message):
         handle_contact_admin(message, last_msg_id)
     elif text == "ℹ️ Help":
         handle_help(message, last_msg_id)
+    elif text == "🔔 Notifications":
+        handle_notifications(message, last_msg_id)
+    elif text == "📈 Statistics":
+        handle_user_statistics(message, last_msg_id)
     elif text == "👑 Admin Panel":
         handle_admin_panel(message, last_msg_id)
     elif text == "🏠 Main Menu":
         handle_commands(message)
     elif text in ["🎫 Generate Key", "👥 All Users", "🤖 All Bots", "📈 Statistics", 
-                  "🗄️ View Database", "💾 Backup DB", "⚙️ Maintenance", "🌐 Nodes Status"]:
+                  "🗄️ View Database", "💾 Backup DB", "⚙️ Maintenance", "🌐 Nodes Status", 
+                  "🔧 Server Logs", "📊 System Info", "🔔 Broadcast", "🔄 Cleanup"]:
         handle_admin_buttons(message, text, last_msg_id)
     else:
         bot.reply_to(message, "❓ Unknown command. Use the keyboard buttons or /help")
@@ -576,12 +909,15 @@ def handle_upload_request(message, last_msg_id=None):
     text = """
 📤 **UPLOAD BOT FILE**
 ━━━━━━━━━━━━━━━━━━━━
+*Auto-Recovery: Enabled*
+━━━━━━━━━━━━━━━━━━━━
 Please send your Python (.py) bot file or ZIP file containing bot.
 
 **Requirements:**
 • Max size: 5.5MB
 • Allowed: .py, .zip
 • Must have main function
+• Auto-recovery will restart on server crash
 ━━━━━━━━━━━━━━━━━━━━
 *Send the file now or type 'cancel' to abort*
 """
@@ -605,9 +941,12 @@ No bots found. Upload your first bot!
         return
     
     running_bots = sum(1 for b in bots if b['status'] == "Running")
+    auto_restart_bots = sum(1 for b in bots if b['auto_restart'] == 1)
     
     text = f"""
 🤖 **MY BOTS**
+━━━━━━━━━━━━━━━━━━━━
+*Auto-Recovery: {auto_restart_bots}/{len(bots)} bots*
 ━━━━━━━━━━━━━━━━━━━━
 **Total Bots:** {len(bots)}
 **Running:** {running_bots}
@@ -619,12 +958,15 @@ No bots found. Upload your first bot!
     markup = types.InlineKeyboardMarkup(row_width=1)
     for bot_info in bots:
         status_icon = "🟢" if bot_info['status'] == "Running" else "🔴"
+        auto_icon = "🔁" if bot_info['auto_restart'] == 1 else "⏸️"
+        created_date = bot_info['created_at'].split()[0] if bot_info['created_at'] else "N/A"
         markup.add(types.InlineKeyboardButton(
-            f"{status_icon} {bot_info['bot_name']}", 
+            f"{status_icon}{auto_icon} {bot_info['bot_name']} ({created_date})", 
             callback_data=f"bot_{bot_info['id']}"
         ))
     
     markup.add(types.InlineKeyboardButton("📤 Upload New Bot", callback_data="upload"))
+    markup.add(types.InlineKeyboardButton("📊 Bot Statistics", callback_data="user_stats"))
     
     edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
 
@@ -652,6 +994,8 @@ def handle_deploy_new(message, last_msg_id=None):
     text = """
 🚀 **DEPLOY BOT**
 ━━━━━━━━━━━━━━━━━━━━
+*Auto-recovery will restart on server crash*
+━━━━━━━━━━━━━━━━━━━━
 Select a bot to deploy:
 ━━━━━━━━━━━━━━━━━━━━
 """
@@ -671,6 +1015,7 @@ def handle_dashboard(message, last_msg_id=None):
     bots = get_user_bots(uid)
     running_bots = sum(1 for b in bots if b['status'] == "Running")
     total_bots = len(bots)
+    auto_restart_bots = sum(1 for b in bots if b['auto_restart'] == 1)
     
     # Get system stats
     stats = get_system_stats()
@@ -691,14 +1036,26 @@ def handle_dashboard(message, last_msg_id=None):
     total_capacity = sum(node['capacity'] for node in nodes)
     used_capacity = sum(node['current_load'] for node in nodes)
     
+    # Get user statistics
+    conn = get_db()
+    c = conn.cursor()
+    total_deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,)).fetchone()[0]
+    today_deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at)=DATE('now')", (uid,)).fetchone()[0]
+    conn.close()
+    
     text = f"""
-📊 **USER DASHBOARD**
+📊 **USER DASHBOARD v3.3.0**
+━━━━━━━━━━━━━━━━━━━━
+*Auto-Recovery System: ACTIVE*
 ━━━━━━━━━━━━━━━━━━━━
 👤 **Account Info:**
 • Status: {'PRIME 👑' if not prime_status['expired'] else 'EXPIRED ⚠️'}
 • File Limit: {user['file_limit']} files
 • Total Bots: {total_bots}/{Config.MAX_BOTS_PER_USER}
 • Running: {running_bots}
+• Auto-Restart: {auto_restart_bots}/{total_bots}
+• Total Deployments: {total_deployments}
+• Today: {today_deployments}
 ━━━━━━━━━━━━━━━━━━━━
 🖥️ **System Status:**
 • CPU: {cpu_bar} {cpu_usage:.1f}%
@@ -706,12 +1063,14 @@ def handle_dashboard(message, last_msg_id=None):
 • Disk: {disk_bar} {disk_usage:.1f}%
 • Active Nodes: {active_nodes}/{len(Config.HOSTING_NODES)}
 • Capacity: {used_capacity}/{total_capacity} bots
+• Last Backup: {stats['last_backup']}
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Platform:**
-• Platform: ZEN X HOSTING 
-• Type: Web Service
+• Platform: ZEN X HOSTING v3.3.0
+• Type: Web Service with Auto-Recovery
 • Max Concurrent: {Config.MAX_CONCURRENT_DEPLOYMENTS}
 • Region: Asia → Bangladesh 🇧🇩
+• Uptime: {stats['uptime_days']} days
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -728,18 +1087,26 @@ def handle_settings(message, last_msg_id=None):
     
     prime_status = check_prime_expiry(uid)
     
+    # Get user preferences
+    conn = get_db()
+    c = conn.cursor()
+    notifications = c.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (uid,)).fetchone()[0]
+    conn.close()
+    
     text = f"""
-⚙️ **SETTINGS**
+⚙️ **SETTINGS v3.3.0**
 ━━━━━━━━━━━━━━━━━━━━
 👤 **Account Settings:**
 • User ID: `{uid}`
 • Status: {'PRIME 👑' if not prime_status['expired'] else 'EXPIRED ⚠️'}
 • File Limit: {user['file_limit']} files
 • Join Date: {user['join_date']}
+• Last Active: {user['last_active'] or 'N/A'}
 ━━━━━━━━━━━━━━━━━━━━
 🔧 **Bot Settings:**
 • Auto-restart: Enabled
-• Notifications: Enabled
+• Auto-recovery: Enabled
+• Notifications: {notifications} unread
 • Language: English
 ━━━━━━━━━━━━━━━━━━━━
 💎 **Prime Status:**
@@ -749,19 +1116,120 @@ def handle_settings(message, last_msg_id=None):
 ━━━━━━━━━━━━━━━━━━━━
 """
     
-    markup = types.InlineKeyboardMarkup()
+    markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("🔄 Renew Prime", callback_data="activate_prime"),
-        types.InlineKeyboardButton("🔔 Notifications", callback_data="notif_settings")
+        types.InlineKeyboardButton("🔔 Notifications", callback_data="notif_settings"),
+        types.InlineKeyboardButton("📊 Statistics", callback_data="user_stats"),
+        types.InlineKeyboardButton("🔄 Update Profile", callback_data="update_profile")
     )
     
     edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
 
+def handle_notifications(message, last_msg_id=None):
+    uid = message.from_user.id
+    
+    conn = get_db()
+    c = conn.cursor()
+    notifications = c.execute("SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,)).fetchall()
+    
+    if not notifications:
+        text = """
+🔔 **NOTIFICATIONS**
+━━━━━━━━━━━━━━━━━━━━
+No notifications found.
+━━━━━━━━━━━━━━━━━━━━
+"""
+        edit_or_send_message(message.chat.id, last_msg_id, text)
+        conn.close()
+        return
+    
+    unread_count = sum(1 for n in notifications if n['is_read'] == 0)
+    
+    text = f"""
+🔔 **NOTIFICATIONS**
+━━━━━━━━━━━━━━━━━━━━
+**Unread:** {unread_count}
+**Total:** {len(notifications)}
+━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    for notif in notifications[:5]:
+        read_icon = "🔵" if notif['is_read'] == 0 else "⚪"
+        text += f"\n{read_icon} {notif['created_at']}\n{notif['message']}\n━━━━━━━━━━━━━━━━━━━━\n"
+    
+    if len(notifications) > 5:
+        text += f"\n... and {len(notifications) - 5} more notifications"
+    
+    # Mark all as read
+    c.execute("UPDATE notifications SET is_read=1 WHERE user_id=?", (uid,))
+    conn.commit()
+    conn.close()
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("📨 Clear All", callback_data="clear_notifications"),
+        types.InlineKeyboardButton("🔄 Refresh", callback_data="refresh_notifications")
+    )
+    
+    edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
+
+def handle_user_statistics(message, last_msg_id=None):
+    uid = message.from_user.id
+    
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Get user stats
+    total_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,)).fetchone()[0]
+    running_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (uid,)).fetchone()[0]
+    total_deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,)).fetchone()[0]
+    today_deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at)=DATE('now')", (uid,)).fetchone()[0]
+    
+    # Get weekly stats
+    week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+    weekly_deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at) >= ?", 
+                                   (uid, week_ago)).fetchone()[0]
+    
+    # Get bot types
+    bot_files = c.execute("SELECT filename, COUNT(*) as count FROM deployments WHERE user_id=? GROUP BY filename", 
+                         (uid,)).fetchall()
+    
+    conn.close()
+    
+    text = f"""
+📈 **USER STATISTICS**
+━━━━━━━━━━━━━━━━━━━━
+👤 **User ID:** `{uid}`
+━━━━━━━━━━━━━━━━━━━━
+📊 **Bot Statistics:**
+• Total Bots: {total_bots}
+• Running Bots: {running_bots}
+• Total Deployments: {total_deployments}
+• Today: {today_deployments}
+• This Week: {weekly_deployments}
+━━━━━━━━━━━━━━━━━━━━
+🤖 **Bot Files:**
+"""
+    
+    for bot_file in bot_files[:5]:
+        text += f"• {bot_file['filename']}: {bot_file['count']} bots\n"
+    
+    if len(bot_files) > 5:
+        text += f"• ... and {len(bot_files) - 5} more files\n"
+    
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    
+    markup = get_stats_keyboard()
+    edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
+
 def handle_premium_info(message, last_msg_id=None):
     text = f"""
-👑 **PRIME FEATURES**
+👑 **PRIME FEATURES v3.3.0**
 ━━━━━━━━━━━━━━━━━━━━
 ✅ **300-Capacity Node Hosting**
+✅ **Auto-Recovery System**
+✅ **Database Backup System**
 ✅ **Priority Support**
 ✅ **Advanced Monitoring**
 ✅ **Custom Bot Names**
@@ -773,6 +1241,9 @@ def handle_premium_info(message, last_msg_id=None):
 ✅ **Bot Export Feature**
 ✅ **Auto-Restart System**
 ✅ **Logs Access**
+✅ **Notifications System**
+✅ **Detailed Statistics**
+✅ **Multi-Region Hosting**
 ━━━━━━━━━━━━━━━━━━━━
 💎 **Get Prime Today!**
 Contact: @{Config.ADMIN_USERNAME}
@@ -833,13 +1304,20 @@ For support, issues, or premium purchase:
 
 def handle_help(message, last_msg_id=None):
     text = """
-ℹ️ **HELP GUIDE**
+ℹ️ **HELP GUIDE v3.3.0**
+━━━━━━━━━━━━━━━━━━━━
+*Auto-Recovery System Features:*
+• Server restart automatically recovers bots
+• Database backups every hour
+• Bot auto-restart on crash
+• Persistent storage across restarts
 ━━━━━━━━━━━━━━━━━━━━
 **How to use:**
 1. First activate Prime with key
 2. Upload your bot file (.py or .zip)
 3. Deploy the bot to a node
-4. Manage your bots from "My Bots"
+4. Enable auto-restart for recovery
+5. Manage your bots from "My Bots"
 ━━━━━━━━━━━━━━━━━━━━
 **Commands:**
 • /start - Main menu
@@ -860,13 +1338,16 @@ def handle_admin_panel(message, last_msg_id=None):
         set_user_session(uid, {'state': 'admin_panel'})
         cleanup_old_messages(uid)
         text = """
-👑 **ADMIN CONTROL PANEL**
+👑 **ADMIN CONTROL PANEL v3.3.0**
+━━━━━━━━━━━━━━━━━━━━
+*Auto-Recovery System: ACTIVE*
 ━━━━━━━━━━━━━━━━━━━━
 Welcome to the admin dashboard.
 Select an option from the keyboard below:
 ━━━━━━━━━━━━━━━━━━━━
 """
-        edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=get_admin_keyboard())
+        msg = edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=get_admin_keyboard())
+        update_message_history(uid, msg.message_id)
     else:
         edit_or_send_message(message.chat.id, last_msg_id, "⛔ Access Denied!")
 
@@ -894,6 +1375,14 @@ def handle_admin_buttons(message, button_text, last_msg_id=None):
         toggle_maintenance_admin(message, last_msg_id)
     elif button_text == "🌐 Nodes Status":
         show_nodes_status(message, last_msg_id)
+    elif button_text == "🔧 Server Logs":
+        show_server_logs(message, last_msg_id)
+    elif button_text == "📊 System Info":
+        show_system_info(message, last_msg_id)
+    elif button_text == "🔔 Broadcast":
+        start_broadcast(message, last_msg_id)
+    elif button_text == "🔄 Cleanup":
+        cleanup_system(message, last_msg_id)
 
 # File Upload Handler
 @bot.message_handler(content_types=['document'])
@@ -976,6 +1465,8 @@ def handle_document(message):
                 msg = bot.send_message(message.chat.id, """
 🤖 **BOT NAME SETUP**
 ━━━━━━━━━━━━━━━━━━━━
+*Auto-recovery will be enabled by default*
+━━━━━━━━━━━━━━━━━━━━
 Enter a name for your bot (max 30 chars):
 Example: `News Bot`, `Music Bot`, `Assistant`
 ━━━━━━━━━━━━━━━━━━━━
@@ -1007,6 +1498,8 @@ Example: `News Bot`, `Music Bot`, `Assistant`
         msg = bot.send_message(message.chat.id, """
 🤖 **BOT NAME SETUP**
 ━━━━━━━━━━━━━━━━━━━━
+*Auto-recovery will be enabled by default*
+━━━━━━━━━━━━━━━━━━━━
 Enter a name for your bot (max 30 chars):
 Example: `News Bot`, `Music Bot`, `Assistant`
 ━━━━━━━━━━━━━━━━━━━━
@@ -1036,11 +1529,12 @@ def process_bot_name_input(message):
     filename = session['filename']
     original_name = session['original_name']
     
-    # Save to database
+    # Save to database with auto_restart enabled by default
     conn = get_db()
     c = conn.cursor()
-    c.execute("INSERT INTO deployments (user_id, bot_name, filename, pid, start_time, status, last_active) VALUES (?, ?, ?, ?, ?, ?, ?)",
-             (uid, bot_name, filename, 0, None, "Uploaded", datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    c.execute("INSERT INTO deployments (user_id, bot_name, filename, pid, start_time, status, last_active, auto_restart, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (uid, bot_name, filename, 0, None, "Uploaded", created_at, 1, created_at, created_at))
     conn.commit()
     
     # Update user bot count
@@ -1058,13 +1552,18 @@ def process_bot_name_input(message):
     text = f"""
 ✅ **FILE UPLOADED SUCCESSFULLY**
 ━━━━━━━━━━━━━━━━━━━━
+*Auto-recovery: ENABLED ✅*
+━━━━━━━━━━━━━━━━━━━━
 🤖 **Bot Name:** {bot_name}
 📁 **File:** `{original_name}`
 📊 **Status:** Ready for setup
+🔁 **Auto-Restart:** Enabled
+📅 **Uploaded:** {created_at}
 ━━━━━━━━━━━━━━━━━━━━
 """
     
     edit_or_send_message(chat_id, None, text, reply_markup=markup)
+    send_notification(uid, f"Bot '{bot_name}' uploaded successfully!")
 
 def process_key_input(message):
     uid = message.from_user.id
@@ -1082,6 +1581,11 @@ def process_key_input(message):
     res = c.execute("SELECT * FROM keys WHERE key=?", (key_input,)).fetchone()
     
     if res:
+        if res['is_used'] == 1:
+            edit_or_send_message(chat_id, None, "❌ **Key already used!**\n\nThis key has already been activated.")
+            conn.close()
+            return
+            
         days, limit = res['duration_days'], res['file_limit']
         
         # Check user's current status
@@ -1103,9 +1607,9 @@ def process_key_input(message):
         last_renewal = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         # Update user
-        c.execute("UPDATE users SET expiry=?, file_limit=?, is_prime=1, last_renewal=? WHERE id=?", 
-                 (expiry_date, limit, last_renewal, uid))
-        c.execute("UPDATE keys SET used_by=?, used_date=? WHERE key=?", 
+        c.execute("UPDATE users SET expiry=?, file_limit=?, is_prime=1, last_renewal=?, last_active=? WHERE id=?", 
+                 (expiry_date, limit, last_renewal, last_renewal, uid))
+        c.execute("UPDATE keys SET used_by=?, used_date=?, is_used=1 WHERE key=?", 
                  (uid, last_renewal, key_input))
         conn.commit()
         
@@ -1138,6 +1642,7 @@ Enjoy all prime features!
         
         clear_user_session(uid)
         edit_or_send_message(chat_id, None, text, reply_markup=get_main_keyboard(uid))
+        send_notification(uid, f"Prime activated successfully! Expires on {expiry_date}")
     else:
         conn.close()
         text = f"""
@@ -1274,6 +1779,153 @@ Share this key with the user.
     except:
         edit_or_send_message(chat_id, None, "❌ Invalid input!")
 
+def process_logs_count(message):
+    """Process logs count input"""
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    
+    if message.text.lower() == 'cancel':
+        clear_user_session(uid)
+        edit_or_send_message(chat_id, None, "❌ Cancelled.", reply_markup=get_admin_keyboard())
+        return
+    
+    try:
+        count = int(message.text.strip())
+        if count <= 0 or count > 100:
+            edit_or_send_message(chat_id, None, "❌ Count must be between 1 and 100!")
+            return
+        
+        show_server_logs_count(message, count)
+        
+    except:
+        edit_or_send_message(chat_id, None, "❌ Invalid input!")
+
+def process_broadcast_message(message):
+    """Process broadcast message"""
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    
+    if message.text.lower() == 'cancel':
+        clear_user_session(uid)
+        edit_or_send_message(chat_id, None, "❌ Cancelled.", reply_markup=get_admin_keyboard())
+        return
+    
+    broadcast_text = message.text.strip()
+    
+    # Get all users
+    conn = get_db()
+    c = conn.cursor()
+    users = c.execute("SELECT id FROM users").fetchall()
+    conn.close()
+    
+    total_users = len(users)
+    success_count = 0
+    fail_count = 0
+    
+    progress_msg = bot.send_message(chat_id, f"📢 **Broadcasting to {total_users} users...**\n\n0/{total_users}")
+    
+    for i, user in enumerate(users):
+        try:
+            bot.send_message(user['id'], f"📢 **Broadcast Message**\n\n{broadcast_text}")
+            success_count += 1
+            
+            # Send notification
+            send_notification(user['id'], f"Broadcast: {broadcast_text[:50]}...")
+            
+        except Exception as e:
+            fail_count += 1
+        
+        # Update progress every 10 users
+        if i % 10 == 0:
+            try:
+                bot.edit_message_text(
+                    f"📢 **Broadcasting to {total_users} users...**\n\n{i}/{total_users}",
+                    chat_id, progress_msg.message_id
+                )
+            except:
+                pass
+    
+    text = f"""
+✅ **BROADCAST COMPLETED**
+━━━━━━━━━━━━━━━━━━━━
+📢 **Message:** {broadcast_text[:100]}...
+━━━━━━━━━━━━━━━━━━━━
+📊 **Results:**
+• Total Users: {total_users}
+• Success: {success_count}
+• Failed: {fail_count}
+• Success Rate: {(success_count/total_users*100):.1f}%
+━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    clear_user_session(uid)
+    bot.edit_message_text(text, chat_id, progress_msg.message_id)
+    edit_or_send_message(chat_id, None, "📢 Broadcast sent!", reply_markup=get_admin_keyboard())
+
+def process_user_id_input(message):
+    """Process user ID input"""
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    
+    if message.text.lower() == 'cancel':
+        clear_user_session(uid)
+        edit_or_send_message(chat_id, None, "❌ Cancelled.", reply_markup=get_admin_keyboard())
+        return
+    
+    try:
+        target_user_id = int(message.text.strip())
+        
+        conn = get_db()
+        c = conn.cursor()
+        user = c.execute("SELECT * FROM users WHERE id=?", (target_user_id,)).fetchone()
+        
+        if not user:
+            edit_or_send_message(chat_id, None, "❌ User not found!")
+            conn.close()
+            return
+        
+        username = user['username'] or f"User_{target_user_id}"
+        expiry = user['expiry'] or "Not Activated"
+        is_prime = "✅" if user['is_prime'] == 1 else "❌"
+        join_date = user['join_date']
+        total_bots = user['total_bots_deployed']
+        
+        # Get user's bots
+        bots = c.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status='Running' THEN 1 ELSE 0 END) as running FROM deployments WHERE user_id=?", 
+                        (target_user_id,)).fetchone()
+        
+        conn.close()
+        
+        text = f"""
+👤 **USER DETAILS**
+━━━━━━━━━━━━━━━━━━━━
+🆔 **ID:** `{target_user_id}`
+👤 **Username:** @{username}
+💎 **Prime:** {is_prime}
+📅 **Join Date:** {join_date}
+⏰ **Expiry:** {expiry}
+━━━━━━━━━━━━━━━━━━━━
+🤖 **Bot Statistics:**
+• Total Bots: {bots['total'] or 0}
+• Running: {bots['running'] or 0}
+• Stopped: {(bots['total'] or 0) - (bots['running'] or 0)}
+• Total Deployed: {total_bots}
+━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("📨 Message User", callback_data=f"msguser_{target_user_id}"),
+            types.InlineKeyboardButton("👁️ View Bots", callback_data=f"viewuser_{target_user_id}"),
+            types.InlineKeyboardButton("⚡ Reset Limit", callback_data=f"resetlimit_{target_user_id}")
+        )
+        
+        clear_user_session(uid)
+        edit_or_send_message(chat_id, None, text, reply_markup=markup)
+        
+    except:
+        edit_or_send_message(chat_id, None, "❌ Invalid user ID!")
+
 # Callback Query Handler
 @bot.callback_query_handler(func=lambda call: True)
 def callback_manager(call):
@@ -1300,6 +1952,14 @@ def callback_manager(call):
             clear_user_session(uid)
             edit_or_send_message(chat_id, message_id, "❌ Cancelled.")
             handle_commands(call.message)
+        elif call.data == "user_stats":
+            handle_user_statistics(call.message, message_id)
+        elif call.data == "notif_settings":
+            handle_notifications(call.message, message_id)
+        elif call.data == "clear_notifications":
+            clear_notifications(call)
+        elif call.data == "refresh_notifications":
+            handle_notifications(call.message, message_id)
         
         elif call.data.startswith("bot_"):
             bot_id = call.data.split("_")[1]
@@ -1334,6 +1994,19 @@ def callback_manager(call):
             bot_id = call.data.split("_")[1]
             show_bot_logs(call, bot_id)
         
+        elif call.data.startswith("autorestart_"):
+            bot_id = call.data.split("_")[1]
+            toggle_auto_restart(call, bot_id)
+        
+        elif call.data.startswith("stats_"):
+            if call.data.startswith("stats_"):
+                parts = call.data.split("_")
+                if len(parts) == 2:
+                    bot_id = parts[1]
+                    show_bot_stats(call, bot_id)
+                else:
+                    handle_user_statistics(call.message, message_id)
+        
         elif call.data == "admin_panel":
             if uid == Config.ADMIN_ID:
                 handle_admin_panel(call.message, message_id)
@@ -1351,6 +2024,18 @@ def callback_manager(call):
         elif call.data == "back_main":
             edit_or_send_message(chat_id, message_id, "🏠 **Main Menu**", reply_markup=get_main_keyboard(uid))
         
+        elif call.data.startswith("msguser_"):
+            user_id = call.data.split("_")[1]
+            message_user(call, user_id)
+        
+        elif call.data.startswith("viewuser_"):
+            user_id = call.data.split("_")[1]
+            view_user_bots(call, user_id)
+        
+        elif call.data.startswith("resetlimit_"):
+            user_id = call.data.split("_")[1]
+            reset_user_limit(call, user_id)
+        
     except Exception as e:
         logger.error(f"Callback error: {e}")
         bot.answer_callback_query(call.id, "⚠️ Error occurred!")
@@ -1363,14 +2048,14 @@ def start_deployment(call, file_id):
     
     conn = get_db()
     c = conn.cursor()
-    bot_info = c.execute("SELECT id, bot_name, filename FROM deployments WHERE id=?", (file_id,)).fetchone()
+    bot_info = c.execute("SELECT id, bot_name, filename, auto_restart FROM deployments WHERE id=?", (file_id,)).fetchone()
     conn.close()
     
     if not bot_info:
         bot.answer_callback_query(call.id, "❌ Bot not found!")
         return
     
-    bot_id, bot_name, filename = bot_info
+    bot_id, bot_name, filename, auto_restart = bot_info
     
     # Check concurrent deployments
     running_bots = sum(1 for b in get_user_bots(uid) if b['status'] == "Running")
@@ -1387,8 +2072,11 @@ def start_deployment(call, file_id):
     text = f"""
 🚀 **DEPLOYING BOT**
 ━━━━━━━━━━━━━━━━━━━━
+*Auto-recovery: {'ENABLED ✅' if auto_restart else 'DISABLED ❌'}*
+━━━━━━━━━━━━━━━━━━━━
 🤖 **Bot:** {bot_name}
-🌐 **Node:** {node['name']} (Capacity: {node['capacity']})
+🌐 **Node:** {node['name']} ({node['region']})
+📊 **Capacity:** {node['current_load']}/{node['capacity']}
 🔄 **Status:** Starting...
 ━━━━━━━━━━━━━━━━━━━━
 """
@@ -1399,10 +2087,11 @@ def start_deployment(call, file_id):
         start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         # Start process
-        logs_dir = Path('logs')
+        logs_dir = Path(Config.LOGS_DIR)
         logs_dir.mkdir(exist_ok=True)
         
-        with open(f'logs/bot_{bot_id}.log', 'w') as log_file:
+        with open(f'{Config.LOGS_DIR}/bot_{bot_id}.log', 'a') as log_file:
+            log_file.write(f"\n{'='*50}\nDeployment started at {start_time}\n{'='*50}\n")
             proc = subprocess.Popen(
                 ['python', str(file_path)],
                 stdout=log_file,
@@ -1410,23 +2099,52 @@ def start_deployment(call, file_id):
                 start_new_session=True
             )
         
+        # Wait for process to start
+        time.sleep(2)
+        
+        # Check if process is running
+        if proc.poll() is not None:
+            # Process failed to start
+            error_msg = "Bot failed to start. Check the bot code."
+            with open(f'{Config.LOGS_DIR}/bot_{bot_id}.log', 'a') as log_file:
+                log_file.write(f"\nERROR: {error_msg}\n")
+            
+            text = f"""
+❌ **DEPLOYMENT FAILED**
+━━━━━━━━━━━━━━━━━━━━
+🤖 **Bot:** {bot_name}
+❌ **Error:** {error_msg}
+━━━━━━━━━━━━━━━━━━━━
+Check your bot code and try again.
+"""
+            edit_or_send_message(chat_id, message_id, text)
+            log_bot_event(bot_id, "DEPLOY_FAILED", error_msg)
+            return
+        
         # Update database
         conn = get_db()
         c = conn.cursor()
-        c.execute("UPDATE deployments SET pid=?, start_time=?, status='Running', node_id=?, last_active=? WHERE id=?", 
-                 (proc.pid, start_time, node['id'], start_time, bot_id))
+        updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        c.execute("UPDATE deployments SET pid=?, start_time=?, status='Running', node_id=?, last_active=?, updated_at=? WHERE id=?", 
+                 (proc.pid, start_time, node['id'], start_time, updated_at, bot_id))
         
         # Update node load
-        c.execute("UPDATE nodes SET current_load=current_load+1 WHERE id=?", (node['id'],))
+        c.execute("UPDATE nodes SET current_load=current_load+1, total_deployed=total_deployed+1 WHERE id=?", (node['id'],))
         conn.commit()
         conn.close()
+        
+        log_event("DEPLOY", f"Bot {bot_name} (ID: {bot_id}) deployed to {node['name']}", uid)
+        log_bot_event(bot_id, "DEPLOY_SUCCESS", f"Deployed to {node['name']}")
         
         # Success message
         text = f"""
 ✅ **BOT DEPLOYED SUCCESSFULLY**
 ━━━━━━━━━━━━━━━━━━━━
+*Auto-recovery: {'ENABLED ✅' if auto_restart else 'DISABLED ❌'}*
+━━━━━━━━━━━━━━━━━━━━
 🤖 **Bot:** {bot_name}
-🌐 **Node:** {node['name']} ({node['current_load']+1}/{node['capacity']})
+🌐 **Node:** {node['name']} ({node['region']})
+📊 **Load:** {node['current_load']+1}/{node['capacity']}
 ⚙️ **PID:** `{proc.pid}`
 ⏰ **Started:** {start_time}
 🔧 **Status:** **RUNNING**
@@ -1434,9 +2152,10 @@ def start_deployment(call, file_id):
 Bot is now active and running!
 """
         edit_or_send_message(chat_id, message_id, text)
+        send_notification(uid, f"Bot '{bot_name}' deployed successfully!")
         
         # Start monitoring
-        start_bot_monitoring(bot_id, proc.pid, chat_id, message_id)
+        start_bot_monitoring(bot_id, proc.pid, uid)
         
     except Exception as e:
         logger.error(f"Deployment error: {e}")
@@ -1448,19 +2167,96 @@ Error: {str(e)}
 Please check your bot code and try again.
 """
         edit_or_send_message(chat_id, message_id, text)
+        log_bot_event(bot_id, "DEPLOY_ERROR", str(e))
 
-def start_bot_monitoring(bot_id, pid, chat_id, message_id):
+def start_bot_monitoring(bot_id, pid, user_id):
     """Start monitoring bot in background"""
     def monitor():
-        for i in range(10):
-            try:
-                stats = get_system_stats()
-                update_bot_stats(bot_id, stats['cpu_percent'], stats['ram_percent'])
+        try:
+            start_time = time.time()
+            while True:
+                # Check if process is still running
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    # Process died
+                    conn = get_db()
+                    c = conn.cursor()
+                    bot_info = c.execute("SELECT bot_name, auto_restart FROM deployments WHERE id=?", (bot_id,)).fetchone()
+                    
+                    if bot_info and bot_info['auto_restart'] == 1:
+                        # Auto-restart enabled
+                        updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        c.execute("UPDATE deployments SET status='Restarting', restart_count=restart_count+1, updated_at=? WHERE id=?", 
+                                 (updated_at, bot_id))
+                        conn.commit()
+                        conn.close()
+                        
+                        # Wait and try to restart
+                        time.sleep(5)
+                        
+                        # Find and restart the bot
+                        conn = get_db()
+                        c = conn.cursor()
+                        bot_data = c.execute("SELECT filename FROM deployments WHERE id=?", (bot_id,)).fetchone()
+                        conn.close()
+                        
+                        if bot_data:
+                            file_path = project_path / bot_data['filename']
+                            if file_path.exists():
+                                start_time_new = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                with open(f'{Config.LOGS_DIR}/bot_{bot_id}.log', 'a') as log_file:
+                                    log_file.write(f"\n{'='*50}\nAuto-restart at {start_time_new}\n{'='*50}\n")
+                                    new_proc = subprocess.Popen(
+                                        ['python', str(file_path)],
+                                        stdout=log_file,
+                                        stderr=subprocess.STDOUT,
+                                        start_new_session=True
+                                    )
+                                
+                                conn = get_db()
+                                c = conn.cursor()
+                                c.execute("UPDATE deployments SET pid=?, start_time=?, status='Running', last_active=? WHERE id=?", 
+                                         (new_proc.pid, start_time_new, start_time_new, bot_id))
+                                conn.commit()
+                                conn.close()
+                                
+                                pid = new_proc.pid
+                                log_bot_event(bot_id, "AUTO_RESTART", "Bot auto-restarted")
+                                send_notification(user_id, f"Bot '{bot_info['bot_name']}' auto-restarted")
+                                continue
+                    
+                    # Mark as stopped
+                    conn = get_db()
+                    c = conn.cursor()
+                    updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    c.execute("UPDATE deployments SET status='Stopped', pid=0, last_active=?, updated_at=? WHERE id=?", 
+                             (updated_at, updated_at, bot_id))
+                    
+                    # Update node load
+                    c.execute("UPDATE nodes SET current_load=current_load-1 WHERE id=(SELECT node_id FROM deployments WHERE id=?)", (bot_id,))
+                    conn.commit()
+                    conn.close()
+                    
+                    log_bot_event(bot_id, "PROCESS_STOPPED", "Bot process stopped")
+                    break
+                
+                # Update stats every 30 seconds
+                if time.time() - start_time > 30:
+                    stats = get_system_stats()
+                    update_bot_stats(bot_id, stats['cpu_percent'], stats['ram_percent'])
+                    start_time = time.time()
+                
                 time.sleep(5)
-            except:
-                break
+                
+        except Exception as e:
+            logger.error(f"Monitoring error for bot {bot_id}: {e}")
     
-    threading.Thread(target=monitor, daemon=True).start()
+    # Start monitoring thread
+    if bot_id not in bot_monitors:
+        monitor_thread = threading.Thread(target=monitor, daemon=True)
+        monitor_thread.start()
+        bot_monitors[bot_id] = monitor_thread
 
 def stop_bot(call, bot_id):
     uid = call.from_user.id
@@ -1481,7 +2277,7 @@ def stop_bot(call, bot_id):
             pass
     
     last_active = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    c.execute("UPDATE deployments SET status='Stopped', pid=0, last_active=? WHERE id=?", (last_active, bot_id))
+    c.execute("UPDATE deployments SET status='Stopped', pid=0, last_active=?, updated_at=? WHERE id=?", (last_active, last_active, bot_id))
     
     if bot_info and bot_info['node_id']:
         c.execute("UPDATE nodes SET current_load=current_load-1 WHERE id=?", (bot_info['node_id'],))
@@ -1489,7 +2285,11 @@ def stop_bot(call, bot_id):
     conn.commit()
     conn.close()
     
+    log_event("STOP", f"Bot {bot_info['bot_name']} (ID: {bot_id}) stopped", uid)
+    log_bot_event(bot_id, "MANUAL_STOP", "Bot stopped by user")
+    
     bot.answer_callback_query(call.id, f"✅ {bot_info['bot_name']} stopped successfully!")
+    send_notification(uid, f"Bot '{bot_info['bot_name']}' stopped")
     show_bot_details(call, bot_id)
 
 def restart_bot(call, bot_id):
@@ -1504,18 +2304,86 @@ def restart_bot(call, bot_id):
     if bot_info and bot_info['pid']:
         try:
             os.kill(bot_info['pid'], signal.SIGTERM)
+            time.sleep(1)
         except:
             pass
     
-    c.execute("UPDATE deployments SET status='Restarting', restart_count=restart_count+1 WHERE id=?", (bot_id,))
+    c.execute("UPDATE deployments SET status='Restarting', restart_count=restart_count+1, updated_at=? WHERE id=?", 
+             (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), bot_id))
     conn.commit()
     conn.close()
+    
+    log_event("RESTART", f"Bot {bot_info['bot_name']} (ID: {bot_id}) restarting", uid)
     
     bot.answer_callback_query(call.id, "🔄 Restarting bot...")
     
     # Wait and restart
     time.sleep(2)
     start_deployment(call, bot_id)
+
+def toggle_auto_restart(call, bot_id):
+    conn = get_db()
+    c = conn.cursor()
+    bot_info = c.execute("SELECT bot_name, auto_restart FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    
+    if bot_info:
+        new_status = 0 if bot_info['auto_restart'] == 1 else 1
+        c.execute("UPDATE deployments SET auto_restart=? WHERE id=?", (new_status, bot_id))
+        conn.commit()
+        
+        status_text = "ENABLED ✅" if new_status == 1 else "DISABLED ❌"
+        bot.answer_callback_query(call.id, f"Auto-restart {status_text} for {bot_info['bot_name']}")
+        
+        log_event("AUTO_RESTART_TOGGLE", f"Bot {bot_info['bot_name']} auto-restart set to {status_text}", call.from_user.id)
+        send_notification(call.from_user.id, f"Auto-restart {status_text.lower()} for bot '{bot_info['bot_name']}'")
+    
+    conn.close()
+    show_bot_details(call, bot_id)
+
+def show_bot_stats(call, bot_id):
+    conn = get_db()
+    c = conn.cursor()
+    bot_info = c.execute("SELECT * FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    
+    if not bot_info:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
+        return
+    
+    # Get bot logs
+    logs = c.execute("SELECT * FROM bot_logs WHERE bot_id=? ORDER BY id DESC LIMIT 10", (bot_id,)).fetchall()
+    
+    conn.close()
+    
+    bot_name = bot_info['bot_name']
+    restart_count = bot_info['restart_count']
+    created_at = bot_info['created_at']
+    updated_at = bot_info['updated_at']
+    
+    text = f"""
+📊 **BOT STATISTICS**
+━━━━━━━━━━━━━━━━━━━━
+🤖 **Bot:** {bot_name}
+🆔 **ID:** {bot_id}
+━━━━━━━━━━━━━━━━━━━━
+📈 **Stats:**
+• Restart Count: {restart_count}
+• Created: {created_at}
+• Last Updated: {updated_at}
+• Auto-Restart: {'Enabled ✅' if bot_info['auto_restart'] == 1 else 'Disabled ❌'}
+━━━━━━━━━━━━━━━━━━━━
+📜 **Recent Events:**
+"""
+    
+    if logs:
+        for log in logs:
+            text += f"\n• {log['timestamp']} - {log['log_type']}: {log['message'][:50]}"
+    else:
+        text += "\nNo events recorded."
+    
+    text += "\n━━━━━━━━━━━━━━━━━━━━"
+    
+    bot.send_message(call.message.chat.id, text)
+    bot.answer_callback_query(call.id, "📊 Statistics sent!")
 
 def export_bot(call, bot_id):
     conn = get_db()
@@ -1534,7 +2402,7 @@ def export_bot(call, bot_id):
         try:
             with open(zip_path, 'rb') as f:
                 bot.send_document(call.message.chat.id, f, 
-                                 caption=f"📦 **Bot Export:** {bot_name}\n\nFile: `{filename}`\nExport Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                                 caption=f"📦 **Bot Export:** {bot_name}\n\nFile: `{filename}`\nExport Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nAuto-Recovery: Included")
             
             time.sleep(2)
             zip_path.unlink(missing_ok=True)
@@ -1563,6 +2431,8 @@ def show_bot_details(call, bot_id):
     ram_usage = bot_info['ram_usage'] or 0
     node_id = bot_info['node_id']
     restart_count = bot_info['restart_count']
+    auto_restart = bot_info['auto_restart']
+    created_at = bot_info['created_at']
     
     stats = get_system_stats()
     cpu_usage = cpu_usage or stats['cpu_percent']
@@ -1574,13 +2444,24 @@ def show_bot_details(call, bot_id):
     # Check if process is running
     is_running = get_process_stats(pid) if pid else False
     
+    # Get node info
+    conn = get_db()
+    c = conn.cursor()
+    node_info = c.execute("SELECT name, region FROM nodes WHERE id=?", (node_id,)).fetchone() if node_id else None
+    conn.close()
+    
+    node_text = f"{node_info['name']} ({node_info['region']})" if node_info else "N/A"
+    
     text = f"""
 🤖 **BOT DETAILS**
+━━━━━━━━━━━━━━━━━━━━
+*Auto-Recovery: {'ENABLED ✅' if auto_restart == 1 else 'DISABLED ❌'}*
 ━━━━━━━━━━━━━━━━━━━━
 **Name:** {bot_name}
 **File:** `{filename}`
 **Status:** {"🟢 Running" if is_running else "🔴 Stopped"}
-**Node:** Node-{node_id if node_id else 'N/A'}
+**Node:** {node_text}
+**Created:** {created_at}
 ━━━━━━━━━━━━━━━━━━━━
 📊 **Statistics:**
 • CPU: {cpu_bar} {cpu_usage:.1f}%
@@ -1588,6 +2469,7 @@ def show_bot_details(call, bot_id):
 • PID: `{pid if pid else "N/A"}`
 • Uptime: {calculate_uptime(start_time) if start_time else "N/A"}
 • Restarts: {restart_count}
+• Auto-Restart: {'Yes' if auto_restart == 1 else 'No'}
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1595,7 +2477,7 @@ def show_bot_details(call, bot_id):
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
 def show_bot_logs(call, bot_id):
-    log_file = f'logs/bot_{bot_id}.log'
+    log_file = f'{Config.LOGS_DIR}/bot_{bot_id}.log'
     
     if not os.path.exists(log_file):
         bot.answer_callback_query(call.id, "📜 No logs available")
@@ -1603,21 +2485,27 @@ def show_bot_logs(call, bot_id):
     
     try:
         with open(log_file, 'r') as f:
-            logs = f.read()[-2000:]  # Last 2000 chars
+            logs = f.read()[-3000:]  # Last 3000 chars
         
-        if len(logs) > 1000:
-            logs = logs[-1000:] + "\n\n... (truncated)"
+        if len(logs) > 1500:
+            logs = logs[-1500:] + "\n\n... (truncated, view full logs in file)"
+        
+        # Get bot name
+        conn = get_db()
+        c = conn.cursor()
+        bot_name = c.execute("SELECT bot_name FROM deployments WHERE id=?", (bot_id,)).fetchone()['bot_name']
+        conn.close()
         
         text = f"""
-📜 **BOT LOGS**
+📜 **BOT LOGS: {bot_name}**
 ━━━━━━━━━━━━━━━━━━━━
 {logs}
 ━━━━━━━━━━━━━━━━━━━━
 """
         bot.send_message(call.message.chat.id, text)
         bot.answer_callback_query(call.id, "📜 Logs sent!")
-    except:
-        bot.answer_callback_query(call.id, "❌ Error reading logs")
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Error reading logs: {str(e)[:50]}")
 
 def confirm_delete_bot(call, bot_id):
     conn = get_db()
@@ -1650,10 +2538,10 @@ def confirm_delete_action(call, bot_id):
     
     conn = get_db()
     c = conn.cursor()
-    bot_info = c.execute("SELECT filename, pid, node_id FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    bot_info = c.execute("SELECT filename, pid, node_id, bot_name FROM deployments WHERE id=?", (bot_id,)).fetchone()
     
     if bot_info:
-        filename, pid, node_id = bot_info
+        filename, pid, node_id, bot_name = bot_info
         
         # Stop bot if running
         if pid:
@@ -1674,15 +2562,33 @@ def confirm_delete_action(call, bot_id):
         # Delete from database
         c.execute("DELETE FROM deployments WHERE id=?", (bot_id,))
         
+        # Delete bot logs
+        c.execute("DELETE FROM bot_logs WHERE bot_id=?", (bot_id,))
+        
         # Update user bot count
         update_user_bot_count(uid)
         
         conn.commit()
+        
+        log_event("DELETE", f"Bot {bot_name} (ID: {bot_id}) deleted", uid)
+        send_notification(uid, f"Bot '{bot_name}' deleted")
     
     conn.close()
     
     bot.answer_callback_query(call.id, "✅ Bot deleted successfully!")
     handle_my_bots(call.message, call.message.message_id)
+
+def clear_notifications(call):
+    uid = call.from_user.id
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM notifications WHERE user_id=?", (uid,))
+    conn.commit()
+    conn.close()
+    
+    bot.answer_callback_query(call.id, "✅ Notifications cleared!")
+    handle_notifications(call.message, call.message.message_id)
 
 def ask_for_libraries(call):
     text = """
@@ -1773,7 +2679,7 @@ Type 'cancel' to abort.
 def show_all_users_admin(message, last_msg_id=None):
     conn = get_db()
     c = conn.cursor()
-    users = c.execute("SELECT id, username, expiry, file_limit, is_prime, join_date FROM users").fetchall()
+    users = c.execute("SELECT id, username, expiry, file_limit, is_prime, join_date, total_bots_deployed, total_deployments FROM users ORDER BY id DESC").fetchall()
     conn.close()
     
     prime_count = sum(1 for u in users if u['is_prime'] == 1)
@@ -1788,23 +2694,34 @@ def show_all_users_admin(message, last_msg_id=None):
 ━━━━━━━━━━━━━━━━━━━━
 """
     
-    for user in users[:15]:
+    for user in users[:10]:
         username = user['username'] if user['username'] else f"User_{user['id']}"
-        status = "👑 Prime" if user['is_prime'] else "🆓 Free"
-        text += f"\n• {username} (ID: {user['id']}) - {status}"
+        status = "👑" if user['is_prime'] else "🆓"
+        text += f"\n{status} **{username}** (ID: {user['id']})"
+        text += f"\n• Bots: {user['total_bots_deployed']} | Deployments: {user['total_deployments']}"
+        text += f"\n• Expiry: {user['expiry'] or 'N/A'}\n━━━━━━━━━━━━━━━━━━━━\n"
     
-    if len(users) > 15:
-        text += f"\n\n... and {len(users) - 15} more users"
+    if len(users) > 10:
+        text += f"\n... and {len(users) - 10} more users"
     
-    edit_or_send_message(message.chat.id, last_msg_id, text)
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔍 Search User", callback_data="search_user"))
+    
+    edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
 
 def show_all_bots_admin(message, last_msg_id=None):
     conn = get_db()
     c = conn.cursor()
-    bots = c.execute("SELECT d.id, d.bot_name, d.status, d.start_time, u.username FROM deployments d LEFT JOIN users u ON d.user_id = u.id ORDER BY d.id DESC LIMIT 20").fetchall()
+    bots = c.execute("""
+        SELECT d.id, d.bot_name, d.status, d.start_time, u.username, d.auto_restart, d.restart_count 
+        FROM deployments d 
+        LEFT JOIN users u ON d.user_id = u.id 
+        ORDER BY d.id DESC LIMIT 20
+    """).fetchall()
     conn.close()
     
     running_bots = sum(1 for b in bots if b['status'] == "Running")
+    auto_restart_bots = sum(1 for b in bots if b['auto_restart'] == 1)
     total_bots = len(bots)
     
     text = f"""
@@ -1813,13 +2730,19 @@ def show_all_bots_admin(message, last_msg_id=None):
 📊 **Total Bots:** {total_bots}
 🟢 **Running:** {running_bots}
 🔴 **Stopped:** {total_bots - running_bots}
+🔁 **Auto-Restart:** {auto_restart_bots}
 ━━━━━━━━━━━━━━━━━━━━
 """
     
-    for bot_info in bots[:10]:
+    for bot_info in bots[:5]:
         if bot_info['bot_name']:
             username = bot_info['username'] if bot_info['username'] else "Unknown"
-            text += f"\n• {bot_info['bot_name']} (User: @{username}) - {bot_info['status']}"
+            auto_icon = "🔁" if bot_info['auto_restart'] == 1 else "⏸️"
+            status_icon = "🟢" if bot_info['status'] == "Running" else "🔴"
+            text += f"\n{status_icon}{auto_icon} **{bot_info['bot_name']}**"
+            text += f"\n• User: @{username}"
+            text += f"\n• Status: {bot_info['status']}"
+            text += f"\n• Restarts: {bot_info['restart_count']}\n━━━━━━━━━━━━━━━━━━━━\n"
     
     edit_or_send_message(message.chat.id, last_msg_id, text)
 
@@ -1831,7 +2754,14 @@ def show_admin_stats(message, last_msg_id=None):
     prime_users = c.execute("SELECT COUNT(*) FROM users WHERE is_prime=1").fetchone()[0]
     total_bots = c.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
     running_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE status='Running'").fetchone()[0]
+    auto_restart_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE auto_restart=1").fetchone()[0]
     total_keys = c.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
+    used_keys = c.execute("SELECT COUNT(*) FROM keys WHERE is_used=1").fetchone()[0]
+    
+    # Today's stats
+    today = datetime.now().strftime('%Y-%m-%d')
+    new_users_today = c.execute("SELECT COUNT(*) FROM users WHERE DATE(join_date)=?", (today,)).fetchone()[0]
+    deployments_today = c.execute("SELECT COUNT(*) FROM deployments WHERE DATE(created_at)=?", (today,)).fetchone()[0]
     
     conn.close()
     
@@ -1844,34 +2774,44 @@ def show_admin_stats(message, last_msg_id=None):
     available_capacity = total_capacity - running_bots
     
     text = f"""
-📈 **ADMIN STATISTICS**
+📈 **ADMIN STATISTICS v3.3.0**
+━━━━━━━━━━━━━━━━━━━━
+*Auto-Recovery System: ACTIVE*
 ━━━━━━━━━━━━━━━━━━━━
 👥 **User Stats:**
 • Total Users: {total_users}
 • Prime Users: {prime_users}
 • Free Users: {total_users - prime_users}
+• New Today: {new_users_today}
 ━━━━━━━━━━━━━━━━━━━━
 🤖 **Bot Stats:**
 • Total Bots: {total_bots}
 • Running Bots: {running_bots}
 • Stopped Bots: {total_bots - running_bots}
+• Auto-Restart Bots: {auto_restart_bots}
+• Deployments Today: {deployments_today}
 ━━━━━━━━━━━━━━━━━━━━
 🔑 **Key Stats:**
 • Total Keys: {total_keys}
+• Used Keys: {used_keys}
+• Available Keys: {total_keys - used_keys}
 ━━━━━━━━━━━━━━━━━━━━
 🖥️ **System Status:**
 • CPU Usage: {cpu_usage:.1f}%
 • RAM Usage: {ram_usage:.1f}%
 • Disk Usage: {disk_usage:.1f}%
+• Last Backup: {stats['last_backup']}
+• Total Backups: {stats['backup_count']}
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Info:**
-• Platform: ZEN X HOST v3.2.7
+• Platform: ZEN X HOST v3.3.0
 • Port: {Config.PORT}
-• Nodes: {len(Config.HOSTING_NODES)} x 900 capacity
+• Nodes: {len(Config.HOSTING_NODES)} x 300 capacity
 • Total Capacity: {total_capacity} bots
 • Used Capacity: {running_bots} bots
 • Available: {available_capacity} bots
 • Bot: @{Config.BOT_USERNAME}
+• Auto-Recovery: {'Enabled' if Config.AUTO_RESTART_BOTS else 'Disabled'}
 ━━━━━━━━━━━━━━━━━━━━
 """
     edit_or_send_message(message.chat.id, last_msg_id, text)
@@ -1887,7 +2827,7 @@ def view_database_page_admin(message, page_num, last_msg_id=None):
     c = conn.cursor()
     
     deployments = c.execute("""
-        SELECT d.id, d.bot_name, d.filename, d.status, u.username, d.last_active, d.node_id
+        SELECT d.id, d.bot_name, d.filename, d.status, u.username, d.last_active, d.node_id, d.auto_restart, d.restart_count
         FROM deployments d 
         LEFT JOIN users u ON d.user_id = u.id 
         ORDER BY d.id DESC
@@ -1915,6 +2855,8 @@ def view_database_page_admin(message, page_num, last_msg_id=None):
             text += f"  📁 File: `{dep['filename']}`\n"
             text += f"  📊 Status: {dep['status']}\n"
             text += f"  🌐 Node: {dep['node_id'] if dep['node_id'] else 'N/A'}\n"
+            text += f"  🔁 Auto-Restart: {'Yes' if dep['auto_restart'] == 1 else 'No'}\n"
+            text += f"  🔄 Restarts: {dep['restart_count']}\n"
     else:
         text += "\nNo bots found.\n"
     
@@ -1934,24 +2876,20 @@ def view_database_page_admin(message, page_num, last_msg_id=None):
 
 def backup_database_admin(message, last_msg_id=None):
     try:
-        backup_dir = Path('backups')
-        backup_dir.mkdir(exist_ok=True)
+        backup_path = backup_database()
         
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_filename = f"zenx_db_backup_{timestamp}.db"
-        backup_path = backup_dir / backup_filename
-        
-        import shutil
-        shutil.copy2(Config.DB_NAME, backup_path)
-        
-        with open(backup_path, 'rb') as f:
-            bot.send_document(message.chat.id, f, 
-                             caption=f"💾 **Database Backup**\n\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nFile: `{backup_filename}`\nSize: {backup_path.stat().st_size / 1024:.1f} KB")
-        
-        time.sleep(2)
-        backup_path.unlink(missing_ok=True)
-        
-        edit_or_send_message(message.chat.id, last_msg_id, "✅ Backup created and sent successfully!")
+        if backup_path and backup_path.exists():
+            with open(backup_path, 'rb') as f:
+                bot.send_document(message.chat.id, f, 
+                                 caption=f"💾 **Database Backup**\n\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nFile: `{backup_path.name}`\nSize: {backup_path.stat().st_size / 1024:.1f} KB\nAuto-Recovery: Enabled")
+            
+            time.sleep(2)
+            backup_path.unlink(missing_ok=True)
+            
+            edit_or_send_message(message.chat.id, last_msg_id, "✅ Backup created and sent successfully!")
+            send_notification(message.from_user.id, "Database backup created successfully")
+        else:
+            edit_or_send_message(message.chat.id, last_msg_id, "❌ Backup failed!")
         
     except Exception as e:
         edit_or_send_message(message.chat.id, last_msg_id, f"❌ Backup failed: {str(e)}")
@@ -1971,6 +2909,7 @@ Only admin can access the system when enabled.
 ━━━━━━━━━━━━━━━━━━━━
 """
     edit_or_send_message(message.chat.id, last_msg_id, text)
+    log_event("MAINTENANCE_TOGGLE", f"Maintenance mode {status}", message.from_user.id)
 
 def show_nodes_status(message, last_msg_id=None):
     conn = get_db()
@@ -1983,11 +2922,12 @@ def show_nodes_status(message, last_msg_id=None):
     available_capacity = total_capacity - used_capacity
     
     text = f"""
-🌐 **NODES STATUS**
+🌐 **NODES STATUS v3.3.0**
 ━━━━━━━━━━━━━━━━━━━━
 **Total Capacity:** {total_capacity} bots
 **Used Capacity:** {used_capacity} bots
 **Available:** {available_capacity} bots
+**Auto-Recovery:** {'ENABLED ✅' if Config.AUTO_RESTART_BOTS else 'DISABLED ❌'}
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1996,14 +2936,203 @@ def show_nodes_status(message, last_msg_id=None):
         load_bar = create_progress_bar(load_percent)
         status_icon = "🟢" if node['status'] == 'active' else "🔴"
         
-        text += f"\n{status_icon} **{node['name']}**"
+        text += f"\n{status_icon} **{node['name']}** ({node['region']})"
         text += f"\n• Status: {node['status']}"
         text += f"\n• Load: {load_bar} {load_percent:.1f}%"
         text += f"\n• Capacity: {node['current_load']}/{node['capacity']}"
+        text += f"\n• Total Deployed: {node['total_deployed']}"
         text += f"\n• Last Check: {node['last_check']}"
         text += "\n━━━━━━━━━━━━━━━━━━━━\n"
     
     edit_or_send_message(message.chat.id, last_msg_id, text)
+
+def show_server_logs(message, last_msg_id=None):
+    uid = message.from_user.id
+    set_user_session(uid, {'state': 'waiting_for_logs_count'})
+    
+    text = """
+🔧 **SERVER LOGS**
+━━━━━━━━━━━━━━━━━━━━
+Enter number of logs to view (1-100):
+Example: 10, 20, 50
+━━━━━━━━━━━━━━━━━━━━
+Type 'cancel' to abort.
+"""
+    edit_or_send_message(message.chat.id, last_msg_id, text)
+
+def show_server_logs_count(message, count=10):
+    conn = get_db()
+    c = conn.cursor()
+    logs = c.execute("SELECT * FROM server_logs ORDER BY id DESC LIMIT ?", (count,)).fetchall()
+    conn.close()
+    
+    text = f"""
+🔧 **SERVER LOGS (Last {len(logs)} entries)**
+━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    if logs:
+        for log in logs:
+            user_info = f" (User: {log['user_id']})" if log['user_id'] else ""
+            text += f"\n**{log['timestamp']}** - {log['event']}{user_info}\n"
+            text += f"`{log['details'][:100]}{'...' if len(log['details']) > 100 else ''}`\n"
+            text += "━━━━━━━━━━━━━━━━━━━━\n"
+    else:
+        text += "\nNo logs found.\n"
+    
+    edit_or_send_message(message.chat.id, None, text)
+
+def show_system_info(message, last_msg_id=None):
+    stats = get_system_stats()
+    
+    text = f"""
+🖥️ **SYSTEM INFORMATION v3.3.0**
+━━━━━━━━━━━━━━━━━━━━
+📊 **System Stats:**
+• Platform: {stats['platform']}
+• Python: {stats['python_version']}
+• Uptime: {stats['uptime_days']} days
+• CPU: {stats['cpu_percent']:.1f}%
+• RAM: {stats['ram_percent']:.1f}%
+• Disk: {stats['disk_percent']:.1f}%
+━━━━━━━━━━━━━━━━━━━━
+👥 **User Stats:**
+• Total Users: {stats['total_users']}
+• Active Users: {stats['active_users']}
+• New Today: {stats['deployed_today']}
+━━━━━━━━━━━━━━━━━━━━
+🤖 **Bot Stats:**
+• Total Bots: {stats['total_bots']}
+• Running: {stats['running_bots']}
+• Capacity: {stats['used_capacity']}/{stats['total_capacity']}
+━━━━━━━━━━━━━━━━━━━━
+💾 **Backup Info:**
+• Last Backup: {stats['last_backup']}
+• Total Backups: {stats['backup_count']}
+• Auto-Backup: Every {Config.BACKUP_INTERVAL//3600} hours
+━━━━━━━━━━━━━━━━━━━━
+⚙️ **Configuration:**
+• Max Bots/User: {Config.MAX_BOTS_PER_USER}
+• Max Concurrent: {Config.MAX_CONCURRENT_DEPLOYMENTS}
+• Auto-Recovery: {'Enabled ✅' if Config.AUTO_RESTART_BOTS else 'Disabled ❌'}
+• Bot Timeout: {Config.BOT_TIMEOUT}s
+• Admin: @{Config.ADMIN_USERNAME}
+━━━━━━━━━━━━━━━━━━━━
+"""
+    edit_or_send_message(message.chat.id, last_msg_id, text)
+
+def start_broadcast(message, last_msg_id=None):
+    uid = message.from_user.id
+    set_user_session(uid, {'state': 'waiting_for_broadcast'})
+    
+    text = """
+🔔 **BROADCAST MESSAGE**
+━━━━━━━━━━━━━━━━━━━━
+Enter the message to broadcast to all users:
+━━━━━━━━━━━━━━━━━━━━
+Type 'cancel' to abort.
+"""
+    edit_or_send_message(message.chat.id, last_msg_id, text)
+
+def cleanup_system(message, last_msg_id=None):
+    uid = message.from_user.id
+    
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        
+        # Clean old notifications (older than 30 days)
+        month_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+        deleted_notifications = c.execute("DELETE FROM notifications WHERE created_at < ?", (month_ago,)).rowcount
+        
+        # Clean old server logs (older than 7 days)
+        week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+        deleted_logs = c.execute("DELETE FROM server_logs WHERE timestamp < ?", (week_ago,)).rowcount
+        
+        # Clean old bot logs (older than 14 days)
+        two_weeks_ago = (datetime.now() - timedelta(days=14)).strftime('%Y-%m-%d %H:%M:%S')
+        deleted_bot_logs = c.execute("DELETE FROM bot_logs WHERE timestamp < ?", (two_weeks_ago,)).rowcount
+        
+        # Clean old exports (older than 7 days)
+        export_dir = Path(Config.EXPORTS_DIR)
+        deleted_exports = 0
+        if export_dir.exists():
+            for file in export_dir.glob("bot_export_*.zip"):
+                if (datetime.now() - datetime.fromtimestamp(file.stat().st_mtime)).days > 7:
+                    file.unlink()
+                    deleted_exports += 1
+        
+        conn.commit()
+        conn.close()
+        
+        text = f"""
+🔄 **SYSTEM CLEANUP COMPLETED**
+━━━━━━━━━━━━━━━━━━━━
+✅ **Cleanup Results:**
+• Notifications: {deleted_notifications} deleted (older than 30 days)
+• Server Logs: {deleted_logs} deleted (older than 7 days)
+• Bot Logs: {deleted_bot_logs} deleted (older than 14 days)
+• Export Files: {deleted_exports} deleted (older than 7 days)
+━━━━━━━━━━━━━━━━━━━━
+System cleanup completed successfully!
+"""
+        edit_or_send_message(message.chat.id, last_msg_id, text)
+        log_event("CLEANUP", f"System cleanup completed: {deleted_notifications} notifications, {deleted_logs} logs, {deleted_bot_logs} bot logs, {deleted_exports} exports", uid)
+        
+    except Exception as e:
+        edit_or_send_message(message.chat.id, last_msg_id, f"❌ Cleanup failed: {str(e)}")
+
+def message_user(call, user_id):
+    """Send message to specific user"""
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    
+    set_user_session(uid, {'state': 'waiting_for_user_message', 'target_user_id': user_id})
+    
+    bot.send_message(chat_id, f"✍️ **Send message to user {user_id}:**\n\nType your message or 'cancel' to abort.")
+
+def view_user_bots(call, user_id):
+    """View all bots of a specific user"""
+    conn = get_db()
+    c = conn.cursor()
+    user = c.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()
+    bots = c.execute("SELECT * FROM deployments WHERE user_id=? ORDER BY status DESC, id DESC", (user_id,)).fetchall()
+    conn.close()
+    
+    username = user['username'] if user else f"User_{user_id}"
+    
+    text = f"""
+👤 **USER BOTS: @{username}**
+━━━━━━━━━━━━━━━━━━━━
+**Total Bots:** {len(bots)}
+**Running:** {sum(1 for b in bots if b['status'] == 'Running')}
+**Stopped:** {sum(1 for b in bots if b['status'] != 'Running')}
+━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    for bot in bots[:10]:
+        status_icon = "🟢" if bot['status'] == "Running" else "🔴"
+        auto_icon = "🔁" if bot['auto_restart'] == 1 else "⏸️"
+        text += f"\n{status_icon}{auto_icon} **{bot['bot_name']}** (ID: {bot['id']})"
+        text += f"\n• File: `{bot['filename']}`"
+        text += f"\n• Status: {bot['status']}"
+        text += f"\n• Created: {bot['created_at']}\n━━━━━━━━━━━━━━━━━━━━\n"
+    
+    bot.send_message(call.message.chat.id, text)
+    bot.answer_callback_query(call.id, "👤 User bots sent!")
+
+def reset_user_limit(call, user_id):
+    """Reset user's file limit"""
+    conn = get_db()
+    c = conn.cursor()
+    
+    c.execute("UPDATE users SET file_limit=1 WHERE id=?", (user_id,))
+    conn.commit()
+    conn.close()
+    
+    bot.answer_callback_query(call.id, f"✅ User {user_id} file limit reset to 1!")
+    log_event("RESET_LIMIT", f"User {user_id} file limit reset", call.from_user.id)
+    send_notification(user_id, "Your file limit has been reset to 1 by admin.")
 
 # Helper Functions
 def calculate_uptime(start_time_str):
@@ -2071,273 +3200,40 @@ def start_bot_safely():
                 logger.warning("Other error, waiting 5 seconds...")
                 time.sleep(5)
 
-# Flask Routes for Render
+# Flask Routes for Render - Simple JSON API Only
 @app.route('/')
 def home():
     stats = get_system_stats()
-    total_capacity = len(Config.HOSTING_NODES) * 300
     
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>🤖 ZEN X 300-CAPACITY HOST BOT v3.2.0</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                margin: 0;
-                padding: 20px;
-                min-height: 100vh;
-            }}
-            .container {{
-                max-width: 900px;
-                margin: 0 auto;
-                background: rgba(255, 255, 255, 0.1);
-                padding: 30px;
-                border-radius: 20px;
-                backdrop-filter: blur(10px);
-                box-shadow: 0 15px 35px rgba(0, 0, 0, 0.3);
-                border: 1px solid rgba(255, 255, 255, 0.2);
-            }}
-            h1 {{
-                text-align: center;
-                font-size: 2.8em;
-                margin-bottom: 20px;
-                color: #fff;
-                text-shadow: 0 2px 10px rgba(0,0,0,0.3);
-            }}
-            .subtitle {{
-                text-align: center;
-                font-size: 1.2em;
-                margin-bottom: 40px;
-                opacity: 0.9;
-            }}
-            .status {{
-                background: rgba(255, 255, 255, 0.15);
-                padding: 25px;
-                border-radius: 15px;
-                margin: 25px 0;
-                border-left: 6px solid #4CAF50;
-                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
-            }}
-            .feature {{
-                background: rgba(255, 255, 255, 0.1);
-                padding: 20px;
-                margin: 15px 0;
-                border-radius: 12px;
-                display: flex;
-                align-items: center;
-                transition: transform 0.3s, background 0.3s;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-            }}
-            .feature:hover {{
-                transform: translateY(-5px);
-                background: rgba(255, 255, 255, 0.2);
-            }}
-            .feature i {{
-                margin-right: 20px;
-                font-size: 1.8em;
-                color: #FFD700;
-            }}
-            .stats {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 20px;
-                margin: 40px 0;
-            }}
-            .stat-box {{
-                background: rgba(255, 255, 255, 0.15);
-                padding: 25px;
-                border-radius: 15px;
-                text-align: center;
-                transition: transform 0.3s;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-            }}
-            .stat-box:hover {{
-                transform: translateY(-5px);
-                background: rgba(255, 255, 255, 0.2);
-            }}
-            .stat-box i {{
-                font-size: 2.5em;
-                margin-bottom: 15px;
-                color: #4CAF50;
-            }}
-            .btn {{
-                display: inline-block;
-                background: linear-gradient(45deg, #FF416C, #FF4B2B);
-                color: white;
-                padding: 15px 35px;
-                border-radius: 30px;
-                text-decoration: none;
-                font-weight: bold;
-                margin: 10px 10px;
-                transition: all 0.3s;
-                border: none;
-                font-size: 1.1em;
-                box-shadow: 0 5px 15px rgba(255, 65, 108, 0.4);
-            }}
-            .btn:hover {{
-                transform: translateY(-3px);
-                box-shadow: 0 8px 20px rgba(255, 65, 108, 0.6);
-            }}
-            .btn-telegram {{
-                background: linear-gradient(45deg, #0088cc, #00aced);
-                box-shadow: 0 5px 15px rgba(0, 136, 204, 0.4);
-            }}
-            .btn-telegram:hover {{
-                box-shadow: 0 8px 20px rgba(0, 136, 204, 0.6);
-            }}
-            .btn-success {{
-                background: linear-gradient(45deg, #00b09b, #96c93d);
-                box-shadow: 0 5px 15px rgba(0, 176, 155, 0.4);
-            }}
-            .btn-success:hover {{
-                box-shadow: 0 8px 20px rgba(0, 176, 155, 0.6);
-            }}
-            .footer {{
-                text-align: center;
-                margin-top: 50px;
-                padding-top: 30px;
-                border-top: 1px solid rgba(255, 255, 255, 0.3);
-                font-size: 0.9em;
-                opacity: 0.8;
-            }}
-            .btn-container {{
-                text-align: center;
-                margin: 40px 0;
-            }}
-            @media (max-width: 768px) {{
-                .container {{
-                    padding: 20px;
-                    margin: 10px;
-                }}
-                h1 {{
-                    font-size: 2em;
-                }}
-                .stats {{
-                    grid-template-columns: 1fr;
-                }}
-                .btn {{
-                    display: block;
-                    margin: 15px auto;
-                    width: 80%;
-                }}
-            }}
-        </style>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <link rel="icon" href="https://img.icons8.com/color/96/000000/telegram-app.png" type="image/x-icon">
-    </head>
-    <body>
-        <div class="container">
-            <h1><i class="fas fa-robot"></i> ZEN X 300-CAPACITY HOST</h1>
-            <div class="subtitle">
-                Advanced 300-Capacity Multi-Node Telegram Bot Hosting Platform v3.2.0
-            </div>
-            
-            <div class="status">
-                <h2><i class="fas fa-server"></i> Server Status: <span style="color: #4CAF50; font-weight: bold;">✅ ONLINE & RUNNING</span></h2>
-                <p>300-Capacity Multi-Node bot hosting service is running smoothly</p>
-                <p><i class="fas fa-info-circle"></i> Total Capacity: {total_capacity} bots | Active Nodes: {len(Config.HOSTING_NODES)}</p>
-            </div>
-            
-            <div class="stats">
-                <div class="stat-box">
-                    <i class="fas fa-database"></i>
-                    <h3>{total_capacity} Capacity</h3>
-                    <p>High Performance Nodes</p>
-                </div>
-                <div class="stat-box">
-                    <i class="fas fa-sitemap"></i>
-                    <h3>Multi-Node</h3>
-                    <p>{len(Config.HOSTING_NODES)} Active Nodes</p>
-                </div>
-                <div class="stat-box">
-                    <i class="fas fa-robot"></i>
-                    <h3>Bot Hosting</h3>
-                    <p>Unlimited Deployment</p>
-                </div>
-                <div class="stat-box">
-                    <i class="fas fa-shield-alt"></i>
-                    <h3>Secure</h3>
-                    <p>Protected Environment</p>
-                </div>
-            </div>
-            
-            <h2 style="text-align: center; margin-top: 40px;"><i class="fas fa-star"></i> Premium Features</h2>
-            
-            <div class="feature">
-                <i class="fas fa-database"></i>
-                <div>
-                    <h3>300-Capacity Nodes</h3>
-                    <p>Each node supports 300 concurrent bots for maximum scalability.</p>
-                </div>
-            </div>
-            
-            <div class="feature">
-                <i class="fas fa-upload"></i>
-                <div>
-                    <h3>Bot File Upload (.py & .zip)</h3>
-                    <p>Upload and deploy your Python bots easily. Supports both .py files and .zip archives.</p>
-                </div>
-            </div>
-            
-            <div class="feature">
-                <i class="fas fa-chart-line"></i>
-                <div>
-                    <h3>Live Statistics & Monitoring</h3>
-                    <p>Real-time monitoring of your bots with CPU, RAM, and performance metrics.</p>
-                </div>
-            </div>
-            
-            <div class="feature">
-                <i class="fas fa-cogs"></i>
-                <div>
-                    <h3>Library Installation</h3>
-                    <p>Install required Python libraries automatically with pip commands.</p>
-                </div>
-            </div>
-            
-            <div class="feature">
-                <i class="fas fa-history"></i>
-                <div>
-                    <h3>Auto-Restart System</h3>
-                    <p>Bots automatically restart on failure with restart counter.</p>
-                </div>
-            </div>
-            
-            <div class="feature">
-                <i class="fas fa-file-alt"></i>
-                <div>
-                    <h3>Logs Access</h3>
-                    <p>View real-time logs of your running bots for debugging.</p>
-                </div>
-            </div>
-            
-            <div class="btn-container">
-                <a href="https://t.me/{Config.BOT_USERNAME}" class="btn btn-telegram" target="_blank">
-                    <i class="fab fa-telegram"></i> Start Bot on Telegram
-                </a>
-                <a href="https://t.me/{Config.ADMIN_USERNAME}" class="btn btn-success" target="_blank">
-                    <i class="fas fa-crown"></i> Get Prime Subscription
-                </a>
-            </div>
-            
-            <div class="footer">
-                <p><i class="fas fa-code"></i> Powered by ZEN X Development Team | Version 3.2.0</p>
-                <p><i class="fas fa-map-marker-alt"></i> Hosting Region: Asia → Bangladesh 🇧🇩</p>
-                <p>© 2024-2026 ZEN X HOST BOT. All rights reserved.</p>
-                <p style="font-size: 0.8em; margin-top: 10px;">
-                    <i class="fas fa-heart" style="color: #ff4757;"></i> 300-Capacity Multi-Node Hosting System
-                </p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return render_template_string(html)
+    return jsonify({
+        "service": "ZEN X 300-CAPACITY HOST BOT v3.3.0",
+        "status": "running",
+        "version": "3.3.0",
+        "features": [
+            "300-Capacity Multi-Node Hosting",
+            "Auto-Recovery System",
+            "Database Backup System",
+            "Bot Auto-Restart",
+            "File Upload (.py & .zip)",
+            "Library Installation",
+            "Live Monitoring",
+            "Prime Subscription System",
+            "Notifications System",
+            "Multi-Region Hosting"
+        ],
+        "statistics": {
+            "total_capacity": len(Config.HOSTING_NODES) * 300,
+            "active_nodes": len(Config.HOSTING_NODES),
+            "auto_recovery": "enabled",
+            "backup_system": "enabled",
+            "total_users": stats['total_users'],
+            "total_bots": stats['total_bots']
+        },
+        "admin": f"@{Config.ADMIN_USERNAME}",
+        "bot": f"@{Config.BOT_USERNAME}",
+        "region": "Asia → Bangladesh 🇧🇩",
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
 
 @app.route('/health')
 def health():
@@ -2357,7 +3253,7 @@ def health():
         return jsonify({
             "status": "healthy",
             "service": "ZEN X 300-CAPACITY HOST BOT",
-            "version": "3.2.0",
+            "version": "3.3.0",
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "statistics": {
                 "total_users": total_users,
@@ -2367,7 +3263,44 @@ def health():
                 "available_capacity": (len(Config.HOSTING_NODES) * 300) - running_bots
             },
             "system": stats,
-            "nodes": len(Config.HOSTING_NODES)
+            "nodes": len(Config.HOSTING_NODES),
+            "auto_recovery": Config.AUTO_RESTART_BOTS,
+            "database": "online",
+            "bot_status": "running"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/stats')
+def stats():
+    """Get detailed statistics"""
+    stats = get_system_stats()
+    
+    return jsonify({
+        "status": "success",
+        "data": stats,
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
+
+@app.route('/backups')
+def list_backups():
+    """List available backups"""
+    try:
+        backup_dir = Path(Config.BACKUP_DIR)
+        backup_files = list(backup_dir.glob("zenx_backup_*.zip"))
+        
+        backups = []
+        for file in backup_files:
+            backups.append({
+                "filename": file.name,
+                "size": file.stat().st_size,
+                "created": datetime.fromtimestamp(file.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+            })
+        
+        return jsonify({
+            "status": "success",
+            "count": len(backups),
+            "backups": backups
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -2375,13 +3308,12 @@ def health():
 # Start Bot
 if __name__ == '__main__':
     # Create necessary directories
-    Path('exports').mkdir(exist_ok=True)
-    Path('backups').mkdir(exist_ok=True)
-    Path('logs').mkdir(exist_ok=True)
+    for dir_name in [Config.PROJECT_DIR, Config.EXPORTS_DIR, Config.BACKUP_DIR, Config.LOGS_DIR]:
+        Path(dir_name).mkdir(exist_ok=True)
     
     print(f"""
 {'='*60}
-🤖 ZEN X 300-CAPACITY HOST BOT v3.2.0
+🤖 ZEN X 300-CAPACITY HOST BOT v3.3.0
 {'='*60}
 🚀 Starting server...
 • Port: {Config.PORT}
@@ -2389,19 +3321,39 @@ if __name__ == '__main__':
 • Bot: @{Config.BOT_USERNAME}
 • Nodes: {len(Config.HOSTING_NODES)} x 300 capacity
 • Total Capacity: {len(Config.HOSTING_NODES) * 300} bots
+• Auto-Recovery: {'ENABLED ✅' if Config.AUTO_RESTART_BOTS else 'DISABLED ❌'}
+• Backup System: ENABLED ✅
 • Max Bots/User: {Config.MAX_BOTS_PER_USER}
 • Max Concurrent: {Config.MAX_CONCURRENT_DEPLOYMENTS}
+• Bot Timeout: {Config.BOT_TIMEOUT}s
 {'='*60}
     """)
+    
+    # Create initial backup
+    backup_path = backup_database()
+    if backup_path:
+        print(f"📦 Initial backup created: {backup_path.name}")
+    
+    # Start scheduled backups in background
+    backup_thread = threading.Thread(target=schedule_backups, daemon=True)
+    backup_thread.start()
+    print("🔒 Scheduled backups enabled (every hour)")
+    
+    # Recover previously running bots
+    recover_deployments()
+    print("🔄 Auto-recovery system activated")
     
     # Start bot in separate thread with single instance protection
     bot_thread = threading.Thread(target=start_bot_safely, daemon=True)
     bot_thread.start()
     
     print(f"✅ Telegram bot started with single instance protection")
-    print(f"🌐 Flask server starting on port {Config.PORT}")
+    print(f"🌐 Flask API server starting on port {Config.PORT}")
     print(f"📊 Health check: http://0.0.0.0:{Config.PORT}/health")
-    print(f"🏠 Homepage: http://0.0.0.0:{Config.PORT}/")
+    print(f"📈 Stats: http://0.0.0.0:{Config.PORT}/stats")
+    print(f"💾 Backups: http://0.0.0.0:{Config.PORT}/backups")
+    print(f"{'='*60}")
+    print("📢 Use /start in Telegram bot to begin")
     print(f"{'='*60}")
     
     # Start Flask app
