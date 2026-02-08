@@ -1,4 +1,3 @@
-
 import os
 import subprocess
 import sqlite3
@@ -17,7 +16,7 @@ from pathlib import Path
 from telebot import types
 from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
-from flask import Flask, render_template_string, send_file, Response, jsonify
+from flask import Flask, request, jsonify
 from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
@@ -33,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 # Global variable to track if bot is running
 bot_running = False
+current_bot_instance = None
 
 # ১. Configuration
 class Config:
@@ -49,10 +49,10 @@ class Config:
     BOT_USERNAME = 'zen_xbot'
     MAX_BOTS_PER_USER = 5
     MAX_CONCURRENT_DEPLOYMENTS = 4
-    AUTO_RESTART_BOTS = True  # Auto restart bots on server restart
-    BACKUP_INTERVAL = 3600  # Backup every hour in seconds
-    BOT_TIMEOUT = 300  # 5 minutes timeout for bot startup
-    MAX_LOG_SIZE = 10000  # Max 10KB per log file
+    AUTO_RESTART_BOTS = True
+    BACKUP_INTERVAL = 3600
+    BOT_TIMEOUT = 300
+    MAX_LOG_SIZE = 10000
     
     # Updated to 300 capacity nodes
     HOSTING_NODES = [
@@ -61,7 +61,14 @@ class Config:
         {"name": "Node-3", "status": "active", "capacity": 300, "region": "Europe"}
     ]
 
-bot = telebot.TeleBot(Config.TOKEN, parse_mode="Markdown")
+# Create bot instance
+try:
+    bot = telebot.TeleBot(Config.TOKEN, parse_mode="Markdown")
+    logger.info("TeleBot instance created successfully")
+except Exception as e:
+    logger.error(f"Failed to create TeleBot instance: {e}")
+    raise
+
 project_path = Path(Config.PROJECT_DIR)
 project_path.mkdir(exist_ok=True)
 app = Flask(__name__)
@@ -72,7 +79,7 @@ executor = ThreadPoolExecutor(max_workers=10)
 # User session management
 user_sessions = {}
 user_message_history = {}
-bot_monitors = {}  # Store bot monitoring threads
+bot_monitors = {}
 
 # ২. Enhanced Database Functions with Auto-Recovery
 def init_db():
@@ -504,7 +511,7 @@ def create_zip_file(bot_id, bot_name, filename, user_id):
                 'filename': filename,
                 'user_id': user_id,
                 'export_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'version': 'ZEN X HOST BOT v3.3.0',
+                'version': 'ZEN X HOST BOT v3.3.2',
                 'exported_by': 'ZEN X Bot Hosting System',
                 'node_info': '300-Capacity Multi-Node Hosting',
                 'recovery_info': 'Auto-recovery enabled',
@@ -538,7 +545,7 @@ def get_bot_requirements(file_path):
                     if module not in requirements and module not in ['sys', 'os', 'time', 'datetime', 'json', 'random']:
                         requirements.append(module)
         
-        return requirements[:10]  # Return top 10 requirements
+        return requirements[:10]
     except:
         return []
 
@@ -774,7 +781,7 @@ def handle_commands(message):
     notification_badge = f" ({unread_notifications})" if unread_notifications > 0 else ""
     
     text = f"""
-🤖 **ZEN X HOST BOT v3.3.0**
+🤖 **ZEN X HOST BOT v3.3.2**
 *Auto-Recovery System Enabled*
 ━━━━━━━━━━━━━━━━━━━━
 👤 **User:** @{username}
@@ -803,7 +810,7 @@ def handle_admin(message):
         set_user_session(uid, {'state': 'admin_panel'})
         cleanup_old_messages(uid)
         text = """
-👑 **ADMIN CONTROL PANEL v3.3.0**
+👑 **ADMIN CONTROL PANEL v3.3.2**
 ━━━━━━━━━━━━━━━━━━━━
 *Auto-Recovery System: ACTIVE*
 ━━━━━━━━━━━━━━━━━━━━
@@ -1044,7 +1051,7 @@ def handle_dashboard(message, last_msg_id=None):
     conn.close()
     
     text = f"""
-📊 **USER DASHBOARD v3.3.0**
+📊 **USER DASHBOARD v3.3.2**
 ━━━━━━━━━━━━━━━━━━━━
 *Auto-Recovery System: ACTIVE*
 ━━━━━━━━━━━━━━━━━━━━
@@ -1066,7 +1073,7 @@ def handle_dashboard(message, last_msg_id=None):
 • Last Backup: {stats['last_backup']}
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Platform:**
-• Platform: ZEN X HOSTING v3.3.0
+• Platform: ZEN X HOSTING v3.3.2
 • Type: Web Service with Auto-Recovery
 • Max Concurrent: {Config.MAX_CONCURRENT_DEPLOYMENTS}
 • Region: Asia → Bangladesh 🇧🇩
@@ -1094,7 +1101,7 @@ def handle_settings(message, last_msg_id=None):
     conn.close()
     
     text = f"""
-⚙️ **SETTINGS v3.3.0**
+⚙️ **SETTINGS v3.3.2**
 ━━━━━━━━━━━━━━━━━━━━
 👤 **Account Settings:**
 • User ID: `{uid}`
@@ -1225,7 +1232,7 @@ def handle_user_statistics(message, last_msg_id=None):
 
 def handle_premium_info(message, last_msg_id=None):
     text = f"""
-👑 **PRIME FEATURES v3.3.0**
+👑 **PRIME FEATURES v3.3.2**
 ━━━━━━━━━━━━━━━━━━━━
 ✅ **300-Capacity Node Hosting**
 ✅ **Auto-Recovery System**
@@ -1304,7 +1311,7 @@ For support, issues, or premium purchase:
 
 def handle_help(message, last_msg_id=None):
     text = """
-ℹ️ **HELP GUIDE v3.3.0**
+ℹ️ **HELP GUIDE v3.3.2**
 ━━━━━━━━━━━━━━━━━━━━
 *Auto-Recovery System Features:*
 • Server restart automatically recovers bots
@@ -1338,7 +1345,7 @@ def handle_admin_panel(message, last_msg_id=None):
         set_user_session(uid, {'state': 'admin_panel'})
         cleanup_old_messages(uid)
         text = """
-👑 **ADMIN CONTROL PANEL v3.3.0**
+👑 **ADMIN CONTROL PANEL v3.3.2**
 ━━━━━━━━━━━━━━━━━━━━
 *Auto-Recovery System: ACTIVE*
 ━━━━━━━━━━━━━━━━━━━━
@@ -1346,7 +1353,7 @@ Welcome to the admin dashboard.
 Select an option from the keyboard below:
 ━━━━━━━━━━━━━━━━━━━━
 """
-        msg = edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=get_admin_keyboard())
+        msg = edit_or_send_message(message.chat.id, None, text, reply_markup=get_admin_keyboard())
         update_message_history(uid, msg.message_id)
     else:
         edit_or_send_message(message.chat.id, last_msg_id, "⛔ Access Denied!")
@@ -2485,7 +2492,7 @@ def show_bot_logs(call, bot_id):
     
     try:
         with open(log_file, 'r') as f:
-            logs = f.read()[-3000:]  # Last 3000 chars
+            logs = f.read()[-3000:]
         
         if len(logs) > 1500:
             logs = logs[-1500:] + "\n\n... (truncated, view full logs in file)"
@@ -2774,7 +2781,7 @@ def show_admin_stats(message, last_msg_id=None):
     available_capacity = total_capacity - running_bots
     
     text = f"""
-📈 **ADMIN STATISTICS v3.3.0**
+📈 **ADMIN STATISTICS v3.3.2**
 ━━━━━━━━━━━━━━━━━━━━
 *Auto-Recovery System: ACTIVE*
 ━━━━━━━━━━━━━━━━━━━━
@@ -2804,7 +2811,7 @@ def show_admin_stats(message, last_msg_id=None):
 • Total Backups: {stats['backup_count']}
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Info:**
-• Platform: ZEN X HOST v3.3.0
+• Platform: ZEN X HOST v3.3.2
 • Port: {Config.PORT}
 • Nodes: {len(Config.HOSTING_NODES)} x 300 capacity
 • Total Capacity: {total_capacity} bots
@@ -2922,7 +2929,7 @@ def show_nodes_status(message, last_msg_id=None):
     available_capacity = total_capacity - used_capacity
     
     text = f"""
-🌐 **NODES STATUS v3.3.0**
+🌐 **NODES STATUS v3.3.2**
 ━━━━━━━━━━━━━━━━━━━━
 **Total Capacity:** {total_capacity} bots
 **Used Capacity:** {used_capacity} bots
@@ -2986,7 +2993,7 @@ def show_system_info(message, last_msg_id=None):
     stats = get_system_stats()
     
     text = f"""
-🖥️ **SYSTEM INFORMATION v3.3.0**
+🖥️ **SYSTEM INFORMATION v3.3.2**
 ━━━━━━━━━━━━━━━━━━━━
 📊 **System Stats:**
 • Platform: {stats['platform']}
@@ -3175,63 +3182,107 @@ def extract_zip_file(zip_path, extract_to):
         logger.error(f"Error extracting zip: {e}")
         return False
 
-# Single instance bot polling with error handling
+# 409 Error Fix - Single Instance Bot Polling
 def start_bot_safely():
     """Start bot with single instance protection"""
-    global bot_running
+    global bot_running, current_bot_instance
     
     if bot_running:
-        logger.info("Bot is already running, skipping...")
+        logger.warning("Bot is already running, skipping...")
         return
     
-    bot_running = True
-    logger.info("Starting bot polling...")
+    # Create instance lock file
+    lock_file = Path('bot_instance.lock')
+    current_pid = os.getpid()
     
-    while True:
-        try:
-            logger.info("Bot polling started...")
-            bot.polling(none_stop=True, timeout=60)
-        except Exception as e:
-            logger.error(f"Bot polling error: {e}")
-            if "409" in str(e):
-                logger.warning("Conflict detected, waiting 10 seconds...")
-                time.sleep(10)
+    try:
+        if lock_file.exists():
+            # Check if lock is old (more than 5 minutes)
+            lock_time = lock_file.stat().st_mtime
+            if time.time() - lock_time > 300:  # 5 minutes
+                lock_file.unlink()
+                logger.info("Removed stale lock file")
             else:
-                logger.warning("Other error, waiting 5 seconds...")
-                time.sleep(5)
+                logger.warning("Another bot instance is running (lock file exists)")
+                return
+        
+        # Create lock file
+        lock_file.write_text(str(current_pid))
+        bot_running = True
+        current_bot_instance = current_pid
+        
+        logger.info(f"Starting bot polling (PID: {current_pid})...")
+        
+        # Start polling with retry logic
+        retry_count = 0
+        max_retries = 3
+        
+        while bot_running and retry_count < max_retries:
+            try:
+                logger.info(f"Bot polling attempt {retry_count + 1}/{max_retries}")
+                bot.polling(
+                    none_stop=True,
+                    timeout=30,
+                    skip_pending=True,  # Skip pending updates
+                    interval=1  # Polling interval
+                )
+                break
+            except telebot.apihelper.ApiTelegramException as e:
+                if "409" in str(e):
+                    logger.warning(f"409 Conflict detected (attempt {retry_count + 1})")
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        wait_time = retry_count * 10  # Increasing wait time
+                        logger.info(f"Waiting {wait_time} seconds before retry...")
+                        time.sleep(wait_time)
+                        
+                        # Clear pending updates
+                        try:
+                            bot.skip_pending = True
+                            bot.last_update_id = None
+                        except:
+                            pass
+                    else:
+                        logger.error("Max retries reached for 409 conflict")
+                        break
+                elif "401" in str(e):
+                    logger.error("Invalid bot token. Please check BOT_TOKEN.")
+                    break
+                else:
+                    logger.error(f"Telegram API error: {e}")
+                    break
+            except Exception as e:
+                logger.error(f"General polling error: {e}")
+                break
+        
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Critical error in bot polling: {e}")
+    finally:
+        bot_running = False
+        # Clean up lock file if we created it
+        if lock_file.exists():
+            try:
+                lock_file_content = lock_file.read_text()
+                if lock_file_content == str(current_pid):
+                    lock_file.unlink()
+                    logger.info("Lock file removed")
+            except:
+                pass
+        logger.info("Bot instance stopped")
 
-# Flask Routes for Render - Simple JSON API Only
+# Flask Routes for Render
 @app.route('/')
 def home():
     stats = get_system_stats()
     
     return jsonify({
-        "service": "ZEN X 300-CAPACITY HOST BOT v3.3.0",
+        "service": "ZEN X 300-CAPACITY HOST BOT v3.3.2",
         "status": "running",
-        "version": "3.3.0",
-        "features": [
-            "300-Capacity Multi-Node Hosting",
-            "Auto-Recovery System",
-            "Database Backup System",
-            "Bot Auto-Restart",
-            "File Upload (.py & .zip)",
-            "Library Installation",
-            "Live Monitoring",
-            "Prime Subscription System",
-            "Notifications System",
-            "Multi-Region Hosting"
-        ],
-        "statistics": {
-            "total_capacity": len(Config.HOSTING_NODES) * 300,
-            "active_nodes": len(Config.HOSTING_NODES),
-            "auto_recovery": "enabled",
-            "backup_system": "enabled",
-            "total_users": stats['total_users'],
-            "total_bots": stats['total_bots']
-        },
-        "admin": f"@{Config.ADMIN_USERNAME}",
-        "bot": f"@{Config.BOT_USERNAME}",
-        "region": "Asia → Bangladesh 🇧🇩",
+        "version": "3.3.2",
+        "instance_id": os.getpid(),
+        "bot_running": bot_running,
         "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     })
 
@@ -3248,62 +3299,37 @@ def health():
         
         conn.close()
         
-        stats = get_system_stats()
-        
         return jsonify({
             "status": "healthy",
-            "service": "ZEN X 300-CAPACITY HOST BOT",
-            "version": "3.3.0",
+            "bot_running": bot_running,
+            "instance_id": os.getpid(),
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "statistics": {
                 "total_users": total_users,
                 "total_bots": total_bots,
-                "running_bots": running_bots,
-                "total_capacity": len(Config.HOSTING_NODES) * 300,
-                "available_capacity": (len(Config.HOSTING_NODES) * 300) - running_bots
-            },
-            "system": stats,
-            "nodes": len(Config.HOSTING_NODES),
-            "auto_recovery": Config.AUTO_RESTART_BOTS,
-            "database": "online",
-            "bot_status": "running"
+                "running_bots": running_bots
+            }
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/stats')
-def stats():
-    """Get detailed statistics"""
-    stats = get_system_stats()
+@app.route('/stop_bot')
+def stop_bot_route():
+    """Stop bot instance (admin only)"""
+    global bot_running
+    
+    # Simple admin check
+    auth_token = request.args.get('token')
+    if auth_token != str(Config.ADMIN_ID):
+        return jsonify({"status": "unauthorized"}), 401
+    
+    bot_running = False
     
     return jsonify({
-        "status": "success",
-        "data": stats,
-        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        "status": "stopping",
+        "message": "Bot instance stopping...",
+        "instance_id": os.getpid()
     })
-
-@app.route('/backups')
-def list_backups():
-    """List available backups"""
-    try:
-        backup_dir = Path(Config.BACKUP_DIR)
-        backup_files = list(backup_dir.glob("zenx_backup_*.zip"))
-        
-        backups = []
-        for file in backup_files:
-            backups.append({
-                "filename": file.name,
-                "size": file.stat().st_size,
-                "created": datetime.fromtimestamp(file.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
-            })
-        
-        return jsonify({
-            "status": "success",
-            "count": len(backups),
-            "backups": backups
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
 
 # Start Bot
 if __name__ == '__main__':
@@ -3313,21 +3339,21 @@ if __name__ == '__main__':
     
     print(f"""
 {'='*60}
-🤖 ZEN X 300-CAPACITY HOST BOT v3.3.0
+🤖 ZEN X 300-CAPACITY HOST BOT v3.3.2
 {'='*60}
 🚀 Starting server...
+• Instance ID: {os.getpid()}
 • Port: {Config.PORT}
 • Admin: @{Config.ADMIN_USERNAME}
 • Bot: @{Config.BOT_USERNAME}
-• Nodes: {len(Config.HOSTING_NODES)} x 300 capacity
-• Total Capacity: {len(Config.HOSTING_NODES) * 300} bots
+• Single Instance Protection: ENABLED ✅
 • Auto-Recovery: {'ENABLED ✅' if Config.AUTO_RESTART_BOTS else 'DISABLED ❌'}
-• Backup System: ENABLED ✅
-• Max Bots/User: {Config.MAX_BOTS_PER_USER}
-• Max Concurrent: {Config.MAX_CONCURRENT_DEPLOYMENTS}
-• Bot Timeout: {Config.BOT_TIMEOUT}s
+• 409 Conflict Fix: IMPLEMENTED ✅
 {'='*60}
     """)
+    
+    # Initialize database
+    init_db()
     
     # Create initial backup
     backup_path = backup_database()
@@ -3337,21 +3363,20 @@ if __name__ == '__main__':
     # Start scheduled backups in background
     backup_thread = threading.Thread(target=schedule_backups, daemon=True)
     backup_thread.start()
-    print("🔒 Scheduled backups enabled (every hour)")
+    print("🔒 Scheduled backups enabled")
     
     # Recover previously running bots
     recover_deployments()
     print("🔄 Auto-recovery system activated")
     
-    # Start bot in separate thread with single instance protection
+    # Start bot in separate thread
     bot_thread = threading.Thread(target=start_bot_safely, daemon=True)
     bot_thread.start()
     
-    print(f"✅ Telegram bot started with single instance protection")
+    print(f"✅ Telegram bot thread started (PID: {os.getpid()})")
     print(f"🌐 Flask API server starting on port {Config.PORT}")
     print(f"📊 Health check: http://0.0.0.0:{Config.PORT}/health")
-    print(f"📈 Stats: http://0.0.0.0:{Config.PORT}/stats")
-    print(f"💾 Backups: http://0.0.0.0:{Config.PORT}/backups")
+    print(f"🛑 Stop bot: http://0.0.0.0:{Config.PORT}/stop_bot?token={Config.ADMIN_ID}")
     print(f"{'='*60}")
     print("📢 Use /start in Telegram bot to begin")
     print(f"{'='*60}")
@@ -3361,6 +3386,6 @@ if __name__ == '__main__':
         host='0.0.0.0',
         port=Config.PORT,
         debug=False,
-        use_reloader=False,
+        use_reloader=False,  # Important: Disable reloader
         threaded=True
     )
