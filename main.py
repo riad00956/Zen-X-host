@@ -364,42 +364,103 @@ def schedule_backups():
 # System Monitoring Functions
 def get_system_stats():
     """Get system statistics"""
-    total_bots = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)[0] or 0
-    running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE status='Running'", fetchone=True)[0] or 0
-    total_users = execute_db("SELECT COUNT(*) FROM users", fetchone=True)[0] or 0
-    active_users = execute_db("SELECT COUNT(DISTINCT user_id) FROM deployments WHERE status='Running'", fetchone=True)[0] or 0
-    
-    # Get last backup info
-    backup_dir = Path(Config.BACKUP_DIR)
-    backup_files = list(backup_dir.glob("zenx_backup_*.zip"))
-    last_backup = backup_files[-1].stat().st_mtime if backup_files else None
-    
-    # Get total deployed today
-    today = datetime.now().strftime('%Y-%m-%d')
-    deployed_today = execute_db("SELECT COUNT(*) FROM deployments WHERE DATE(created_at)=?", (today,), fetchone=True)[0] or 0
-    
-    stats = {
-        'cpu_percent': random.randint(5, 40),
-        'ram_percent': random.randint(15, 60),
-        'disk_percent': random.randint(20, 70),
-        'total_users': total_users,
-        'active_users': active_users,
-        'total_bots': total_bots,
-        'running_bots': running_bots,
-        'deployed_today': deployed_today,
-        'uptime_days': random.randint(1, 365),
-        'total_capacity': len(Config.HOSTING_NODES) * 300,
-        'available_capacity': (len(Config.HOSTING_NODES) * 300) - running_bots,
-        'last_backup': datetime.fromtimestamp(last_backup).strftime('%Y-%m-%d %H:%M:%S') if last_backup else "Never",
-        'backup_count': len(backup_files),
-        'platform': platform.system(),
-        'python_version': platform.python_version()
-    }
-    return stats
+    try:
+        total_bots = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)
+        if total_bots:
+            total_bots = total_bots[0] or 0
+        else:
+            total_bots = 0
+            
+        running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE status='Running'", fetchone=True)
+        if running_bots:
+            running_bots = running_bots[0] or 0
+        else:
+            running_bots = 0
+            
+        total_users = execute_db("SELECT COUNT(*) FROM users", fetchone=True)
+        if total_users:
+            total_users = total_users[0] or 0
+        else:
+            total_users = 0
+            
+        active_users = execute_db("SELECT COUNT(DISTINCT user_id) FROM deployments WHERE status='Running'", fetchone=True)
+        if active_users:
+            active_users = active_users[0] or 0
+        else:
+            active_users = 0
+        
+        # Get last backup info
+        backup_dir = Path(Config.BACKUP_DIR)
+        backup_files = list(backup_dir.glob("zenx_backup_*.zip"))
+        last_backup = backup_files[-1].stat().st_mtime if backup_files else None
+        
+        # Get total deployed today
+        today = datetime.now().strftime('%Y-%m-%d')
+        deployed_today = execute_db("SELECT COUNT(*) FROM deployments WHERE DATE(created_at)=?", (today,), fetchone=True)
+        if deployed_today:
+            deployed_today = deployed_today[0] or 0
+        else:
+            deployed_today = 0
+        
+        # Get node stats
+        nodes = get_available_nodes()
+        used_capacity = 0
+        total_capacity = 0
+        
+        if nodes:
+            for node in nodes:
+                used_capacity += node['current_load']
+                total_capacity += node['capacity']
+        
+        stats = {
+            'cpu_percent': random.randint(5, 40),
+            'ram_percent': random.randint(15, 60),
+            'disk_percent': random.randint(20, 70),
+            'total_users': total_users,
+            'active_users': active_users,
+            'total_bots': total_bots,
+            'running_bots': running_bots,
+            'deployed_today': deployed_today,
+            'uptime_days': random.randint(1, 365),
+            'total_capacity': total_capacity,
+            'available_capacity': total_capacity - used_capacity,
+            'used_capacity': used_capacity,
+            'last_backup': datetime.fromtimestamp(last_backup).strftime('%Y-%m-%d %H:%M:%S') if last_backup else "Never",
+            'backup_count': len(backup_files),
+            'platform': platform.system(),
+            'python_version': platform.python_version()
+        }
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting system stats: {e}")
+        return {
+            'cpu_percent': 10,
+            'ram_percent': 30,
+            'disk_percent': 40,
+            'total_users': 0,
+            'active_users': 0,
+            'total_bots': 0,
+            'running_bots': 0,
+            'deployed_today': 0,
+            'uptime_days': 1,
+            'total_capacity': 900,
+            'available_capacity': 900,
+            'used_capacity': 0,
+            'last_backup': "Never",
+            'backup_count': 0,
+            'platform': platform.system(),
+            'python_version': platform.python_version()
+        }
 
 def get_available_nodes():
     """Get available hosting nodes"""
-    return execute_db("SELECT * FROM nodes WHERE status='active'", fetchall=True) or []
+    try:
+        nodes = execute_db("SELECT * FROM nodes WHERE status='active'", fetchall=True)
+        if nodes:
+            return nodes
+        return []
+    except:
+        return []
 
 def assign_bot_to_node(user_id, bot_name):
     """Assign bot to an available node"""
@@ -413,10 +474,11 @@ def assign_bot_to_node(user_id, bot_name):
     lowest_load = float('inf')
     
     for node in nodes:
-        load = node['current_load'] / node['capacity']
-        if load < lowest_load:
-            lowest_load = load
-            best_node = node
+        if node['capacity'] > 0:
+            load = node['current_load'] / node['capacity']
+            if load < lowest_load:
+                lowest_load = load
+                best_node = node
     
     return best_node
 
@@ -426,8 +488,18 @@ def get_user(user_id):
 
 def update_user_bot_count(user_id):
     """Update user's bot count"""
-    count = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (user_id,), fetchone=True)[0] or 0
-    deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (user_id,), fetchone=True)[0] or 0
+    count = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (user_id,), fetchone=True)
+    if count:
+        count = count[0] or 0
+    else:
+        count = 0
+        
+    deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (user_id,), fetchone=True)
+    if deployments:
+        deployments = deployments[0] or 0
+    else:
+        deployments = 0
+        
     execute_db("UPDATE users SET total_bots_deployed=?, total_deployments=total_deployments+1 WHERE id=?", 
               (count, user_id), commit=True)
 
@@ -442,13 +514,17 @@ def is_prime(user_id):
     return False
 
 def get_user_bots(user_id):
-    return execute_db("""
+    bots = execute_db("""
         SELECT id, bot_name, filename, pid, start_time, status, node_id, 
                restart_count, auto_restart, created_at 
         FROM deployments 
         WHERE user_id=? 
         ORDER BY status DESC, id DESC
-    """, (user_id,), fetchall=True) or []
+    """, (user_id,), fetchall=True)
+    
+    if bots:
+        return bots
+    return []
 
 def update_bot_stats(bot_id, cpu, ram):
     last_active = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -679,14 +755,25 @@ def edit_or_send_message(chat_id, message_id, text, reply_markup=None, parse_mod
     """Edit existing message or send new one"""
     try:
         if message_id:
-            return bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
+            # Try to edit message
+            try:
+                return bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
+            except telebot.apihelper.ApiException as e:
+                # If edit fails (message can't be edited), send new message
+                if "message can't be edited" in str(e):
+                    msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+                    update_message_history(chat_id, msg.message_id)
+                    return msg
+                else:
+                    raise
         else:
+            # Send new message
             msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
             update_message_history(chat_id, msg.message_id)
             return msg
     except Exception as e:
+        # Log error and send new message
         logger.error(f"Error editing/sending message: {e}")
-        # If edit fails, send new message
         msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
         update_message_history(chat_id, msg.message_id)
         return msg
@@ -725,9 +812,11 @@ def handle_commands(message):
     
     # Check for notifications
     unread_notifications = execute_db("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", 
-                                     (uid,), fetchone=True)[0] or 0
-    
-    notification_badge = f" ({unread_notifications})" if unread_notifications > 0 else ""
+                                     (uid,), fetchone=True)
+    if unread_notifications:
+        unread_notifications = unread_notifications[0] or 0
+    else:
+        unread_notifications = 0
     
     text = f"""
 🤖 **ZEN X HOST BOT v3.3.2**
@@ -736,15 +825,15 @@ def handle_commands(message):
 👤 **User:** @{username}
 🆔 **ID:** `{uid}`
 💎 **Status:** {status}
-📅 **Join Date:** {user['join_date']}
+📅 **Join Date:** {user['join_date'] if user else 'N/A'}
 🔔 **Notifications:** {unread_notifications} unread
 ━━━━━━━━━━━━━━━━━━━━
 📊 **Account Details:**
 • Plan: {plan}
-• File Limit: `{user['file_limit']}` files
+• File Limit: `{user['file_limit'] if user else 1}` files
 • Expiry: {expiry_msg}
-• Total Bots: {user['total_bots_deployed'] or 0}
-• Total Deployments: {user['total_deployments'] or 0}
+• Total Bots: {user['total_bots_deployed'] or 0 if user else 0}
+• Total Deployments: {user['total_deployments'] or 0 if user else 0}
 ━━━━━━━━━━━━━━━━━━━━
 💡 *Use keyboard buttons below:*
 """
@@ -922,7 +1011,6 @@ No bots found. Upload your first bot!
         ))
     
     markup.add(types.InlineKeyboardButton("📤 Upload New Bot", callback_data="upload"))
-    markup.add(types.InlineKeyboardButton("📊 Bot Statistics", callback_data="user_stats"))
     
     edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
 
@@ -986,12 +1074,21 @@ def handle_dashboard(message, last_msg_id=None):
     # Get node status
     nodes = get_available_nodes()
     active_nodes = len(nodes)
-    total_capacity = sum(node['capacity'] for node in nodes)
-    used_capacity = sum(node['current_load'] for node in nodes)
+    total_capacity = stats['total_capacity']
+    used_capacity = stats['used_capacity']
     
     # Get user statistics
-    total_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,), fetchone=True)[0] or 0
-    today_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at)=DATE('now')", (uid,), fetchone=True)[0] or 0
+    total_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,), fetchone=True)
+    if total_deployments:
+        total_deployments = total_deployments[0] or 0
+    else:
+        total_deployments = 0
+        
+    today_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at)=DATE('now')", (uid,), fetchone=True)
+    if today_deployments:
+        today_deployments = today_deployments[0] or 0
+    else:
+        today_deployments = 0
     
     text = f"""
 📊 **USER DASHBOARD v3.3.2**
@@ -1038,7 +1135,11 @@ def handle_settings(message, last_msg_id=None):
     prime_status = check_prime_expiry(uid)
     
     # Get user preferences
-    notifications = execute_db("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (uid,), fetchone=True)[0] or 0
+    notifications = execute_db("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (uid,), fetchone=True)
+    if notifications:
+        notifications = notifications[0] or 0
+    else:
+        notifications = 0
     
     text = f"""
 ⚙️ **SETTINGS v3.3.2**
@@ -1066,9 +1167,7 @@ def handle_settings(message, last_msg_id=None):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("🔄 Renew Prime", callback_data="activate_prime"),
-        types.InlineKeyboardButton("🔔 Notifications", callback_data="notif_settings"),
-        types.InlineKeyboardButton("📊 Statistics", callback_data="user_stats"),
-        types.InlineKeyboardButton("🔄 Update Profile", callback_data="update_profile")
+        types.InlineKeyboardButton("🔔 Notifications", callback_data="notif_settings")
     )
     
     edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
@@ -1120,15 +1219,38 @@ def handle_user_statistics(message, last_msg_id=None):
     uid = message.from_user.id
     
     # Get user stats
-    total_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,), fetchone=True)[0] or 0
-    running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (uid,), fetchone=True)[0] or 0
-    total_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,), fetchone=True)[0] or 0
-    today_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at)=DATE('now')", (uid,), fetchone=True)[0] or 0
+    total_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,), fetchone=True)
+    if total_bots:
+        total_bots = total_bots[0] or 0
+    else:
+        total_bots = 0
+        
+    running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (uid,), fetchone=True)
+    if running_bots:
+        running_bots = running_bots[0] or 0
+    else:
+        running_bots = 0
+        
+    total_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,), fetchone=True)
+    if total_deployments:
+        total_deployments = total_deployments[0] or 0
+    else:
+        total_deployments = 0
+        
+    today_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at)=DATE('now')", (uid,), fetchone=True)
+    if today_deployments:
+        today_deployments = today_deployments[0] or 0
+    else:
+        today_deployments = 0
     
     # Get weekly stats
     week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
     weekly_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at) >= ?", 
-                                   (uid, week_ago), fetchone=True)[0] or 0
+                                   (uid, week_ago), fetchone=True)
+    if weekly_deployments:
+        weekly_deployments = weekly_deployments[0] or 0
+    else:
+        weekly_deployments = 0
     
     # Get bot types
     bot_files = execute_db("SELECT filename, COUNT(*) as count FROM deployments WHERE user_id=? GROUP BY filename", 
@@ -1157,8 +1279,7 @@ def handle_user_statistics(message, last_msg_id=None):
     
     text += "━━━━━━━━━━━━━━━━━━━━\n"
     
-    markup = get_stats_keyboard()
-    edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
+    edit_or_send_message(message.chat.id, last_msg_id, text)
 
 def handle_premium_info(message, last_msg_id=None):
     text = f"""
@@ -1818,9 +1939,9 @@ def process_user_id_input(message):
 ⏰ **Expiry:** {expiry}
 ━━━━━━━━━━━━━━━━━━━━
 🤖 **Bot Statistics:**
-• Total Bots: {bots['total'] or 0}
-• Running: {bots['running'] or 0}
-• Stopped: {(bots['total'] or 0) - (bots['running'] or 0)}
+• Total Bots: {bots['total'] or 0 if bots else 0}
+• Running: {bots['running'] or 0 if bots else 0}
+• Stopped: {(bots['total'] or 0 if bots else 0) - (bots['running'] or 0 if bots else 0)}
 • Total Deployed: {total_bots}
 ━━━━━━━━━━━━━━━━━━━━
 """
@@ -2355,7 +2476,11 @@ def show_bot_logs(call, bot_id):
             logs = logs[-1500:] + "\n\n... (truncated, view full logs in file)"
         
         # Get bot name
-        bot_name = execute_db("SELECT bot_name FROM deployments WHERE id=?", (bot_id,), fetchone=True)['bot_name']
+        bot_name = execute_db("SELECT bot_name FROM deployments WHERE id=?", (bot_id,), fetchone=True)
+        if bot_name:
+            bot_name = bot_name['bot_name']
+        else:
+            bot_name = "Unknown"
         
         text = f"""
 📜 **BOT LOGS: {bot_name}**
@@ -2589,26 +2714,69 @@ def show_all_bots_admin(message, last_msg_id=None):
     edit_or_send_message(message.chat.id, last_msg_id, text)
 
 def show_admin_stats(message, last_msg_id=None):
-    total_users = execute_db("SELECT COUNT(*) FROM users", fetchone=True)[0] or 0
-    prime_users = execute_db("SELECT COUNT(*) FROM users WHERE is_prime=1", fetchone=True)[0] or 0
-    total_bots = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)[0] or 0
-    running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE status='Running'", fetchone=True)[0] or 0
-    auto_restart_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE auto_restart=1", fetchone=True)[0] or 0
-    total_keys = execute_db("SELECT COUNT(*) FROM keys", fetchone=True)[0] or 0
-    used_keys = execute_db("SELECT COUNT(*) FROM keys WHERE is_used=1", fetchone=True)[0] or 0
+    total_users = execute_db("SELECT COUNT(*) FROM users", fetchone=True)
+    if total_users:
+        total_users = total_users[0] or 0
+    else:
+        total_users = 0
+        
+    prime_users = execute_db("SELECT COUNT(*) FROM users WHERE is_prime=1", fetchone=True)
+    if prime_users:
+        prime_users = prime_users[0] or 0
+    else:
+        prime_users = 0
+        
+    total_bots = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)
+    if total_bots:
+        total_bots = total_bots[0] or 0
+    else:
+        total_bots = 0
+        
+    running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE status='Running'", fetchone=True)
+    if running_bots:
+        running_bots = running_bots[0] or 0
+    else:
+        running_bots = 0
+        
+    auto_restart_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE auto_restart=1", fetchone=True)
+    if auto_restart_bots:
+        auto_restart_bots = auto_restart_bots[0] or 0
+    else:
+        auto_restart_bots = 0
+        
+    total_keys = execute_db("SELECT COUNT(*) FROM keys", fetchone=True)
+    if total_keys:
+        total_keys = total_keys[0] or 0
+    else:
+        total_keys = 0
+        
+    used_keys = execute_db("SELECT COUNT(*) FROM keys WHERE is_used=1", fetchone=True)
+    if used_keys:
+        used_keys = used_keys[0] or 0
+    else:
+        used_keys = 0
     
     # Today's stats
     today = datetime.now().strftime('%Y-%m-%d')
-    new_users_today = execute_db("SELECT COUNT(*) FROM users WHERE DATE(join_date)=?", (today,), fetchone=True)[0] or 0
-    deployments_today = execute_db("SELECT COUNT(*) FROM deployments WHERE DATE(created_at)=?", (today,), fetchone=True)[0] or 0
+    new_users_today = execute_db("SELECT COUNT(*) FROM users WHERE DATE(join_date)=?", (today,), fetchone=True)
+    if new_users_today:
+        new_users_today = new_users_today[0] or 0
+    else:
+        new_users_today = 0
+        
+    deployments_today = execute_db("SELECT COUNT(*) FROM deployments WHERE DATE(created_at)=?", (today,), fetchone=True)
+    if deployments_today:
+        deployments_today = deployments_today[0] or 0
+    else:
+        deployments_today = 0
     
     stats = get_system_stats()
     cpu_usage = stats['cpu_percent']
     ram_usage = stats['ram_percent']
     disk_usage = stats['disk_percent']
     
-    total_capacity = len(Config.HOSTING_NODES) * 300
-    available_capacity = total_capacity - running_bots
+    total_capacity = stats['total_capacity']
+    available_capacity = stats['available_capacity']
     
     text = f"""
 📈 **ADMIN STATISTICS v3.3.2**
@@ -2668,8 +2836,13 @@ def view_database_page_admin(message, page_num, last_msg_id=None):
         LIMIT ? OFFSET ?
     """, (items_per_page, offset), fetchall=True) or []
     
-    total_deployments = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)[0] or 0
-    total_pages = (total_deployments + items_per_page - 1) // items_per_page
+    total_deployments = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)
+    if total_deployments:
+        total_deployments = total_deployments[0] or 0
+    else:
+        total_deployments = 0
+        
+    total_pages = (total_deployments + items_per_page - 1) // items_per_page if items_per_page > 0 else 1
     
     text = f"""
 🗄️ **DATABASE VIEWER**
@@ -2866,15 +3039,15 @@ def cleanup_system(message, last_msg_id=None):
     try:
         # Clean old notifications (older than 30 days)
         month_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-        deleted_notifications = execute_db("DELETE FROM notifications WHERE created_at < ?", (month_ago,), commit=True)
+        execute_db("DELETE FROM notifications WHERE created_at < ?", (month_ago,), commit=True)
         
         # Clean old server logs (older than 7 days)
         week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-        deleted_logs = execute_db("DELETE FROM server_logs WHERE timestamp < ?", (week_ago,), commit=True)
+        execute_db("DELETE FROM server_logs WHERE timestamp < ?", (week_ago,), commit=True)
         
         # Clean old bot logs (older than 14 days)
         two_weeks_ago = (datetime.now() - timedelta(days=14)).strftime('%Y-%m-%d %H:%M:%S')
-        deleted_bot_logs = execute_db("DELETE FROM bot_logs WHERE timestamp < ?", (two_weeks_ago,), commit=True)
+        execute_db("DELETE FROM bot_logs WHERE timestamp < ?", (two_weeks_ago,), commit=True)
         
         # Clean old exports (older than 7 days)
         export_dir = Path(Config.EXPORTS_DIR)
@@ -2889,15 +3062,15 @@ def cleanup_system(message, last_msg_id=None):
 🔄 **SYSTEM CLEANUP COMPLETED**
 ━━━━━━━━━━━━━━━━━━━━
 ✅ **Cleanup Results:**
-• Notifications: {deleted_notifications} deleted (older than 30 days)
-• Server Logs: {deleted_logs} deleted (older than 7 days)
-• Bot Logs: {deleted_bot_logs} deleted (older than 14 days)
+• Notifications: cleaned
+• Server Logs: cleaned
+• Bot Logs: cleaned
 • Export Files: {deleted_exports} deleted (older than 7 days)
 ━━━━━━━━━━━━━━━━━━━━
 System cleanup completed successfully!
 """
         edit_or_send_message(message.chat.id, last_msg_id, text)
-        log_event("CLEANUP", f"System cleanup completed: {deleted_notifications} notifications, {deleted_logs} logs, {deleted_bot_logs} bot logs, {deleted_exports} exports", uid)
+        log_event("CLEANUP", f"System cleanup completed: {deleted_exports} exports", uid)
         
     except Exception as e:
         edit_or_send_message(message.chat.id, last_msg_id, f"❌ Cleanup failed: {str(e)}")
@@ -2967,157 +3140,418 @@ def calculate_uptime(start_time_str):
     except:
         return "N/A"
 
+def get_process_stats(
+# Continue from where the code was cut off
 def get_process_stats(pid):
-    """Get stats for a specific process"""
+    """Get process statistics"""
     try:
-        if pid == 0 or pid is None:
-            return False
-        os.kill(pid, 0)
-        return True
-    except:
-        return False
+        if not pid:
+            return None
+            
+        if platform.system() == "Windows":
+            cmd = f'tasklist /FI "PID eq {pid}"'
+        else:
+            cmd = f'ps -p {pid} -o pid,pcpu,pmem,etime,comm'
+            
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        if result.returncode == 0 and str(pid) in result.stdout:
+            lines = result.stdout.strip().split('\n')
+            if len(lines) > 1:
+                if platform.system() == "Windows":
+                    # Parse Windows tasklist output
+                    parts = lines[-1].split()
+                    if len(parts) >= 5:
+                        return {
+                            'pid': pid,
+                            'cpu': float(parts[4].replace(',', '.')) if '%' in parts[4] else 0.0,
+                            'memory': float(parts[5].replace(',', '.')) if '%' in parts[5] else 0.0,
+                            'status': 'Running'
+                        }
+                else:
+                    # Parse Linux ps output
+                    parts = lines[-1].split()
+                    if len(parts) >= 4:
+                        return {
+                            'pid': pid,
+                            'cpu': float(parts[1]),
+                            'memory': float(parts[2]),
+                            'uptime': parts[3],
+                            'status': 'Running'
+                        }
+        return None
+    except Exception as e:
+        logger.error(f"Error getting process stats for PID {pid}: {e}")
+        return None
 
-def extract_zip_file(zip_path, extract_to):
-    """Extract zip file to directory"""
+def extract_zip_file(zip_path, extract_dir):
+    """Extract ZIP file"""
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_to)
+            zip_ref.extractall(extract_dir)
         return True
     except Exception as e:
-        logger.error(f"Error extracting zip: {e}")
+        logger.error(f"Error extracting ZIP: {e}")
         return False
 
-# 409 Error Fix - Single Instance Bot Polling
-def start_bot_safely():
-    """Start bot with single instance protection"""
-    # Remove any existing webhook first
+def calculate_uptime(start_time_str):
+    """Calculate uptime from start time"""
+    if not start_time_str:
+        return "0s"
+    
     try:
-        bot.remove_webhook()
-        time.sleep(1)
+        start_time = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S')
+        uptime = datetime.now() - start_time
+        
+        days = uptime.days
+        hours, remainder = divmod(uptime.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        if days > 0:
+            return f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            return f"{hours}h {minutes}m"
+        elif minutes > 0:
+            return f"{minutes}m {seconds}s"
+        else:
+            return f"{seconds}s"
     except:
-        pass
-    
-    logger.info("Starting bot polling...")
-    
-    try:
-        # Set last_update_id to 0 to avoid NoneType error
-        bot.last_update_id = 0
-        
-        # Start polling with safe parameters
-        bot.polling(
-            none_stop=True,
-            timeout=60,
-            skip_pending=True,
-            interval=2,
-            allowed_updates=[]
-        )
-    except Exception as e:
-        logger.error(f"Bot polling error: {e}")
-        # Wait and retry
-        time.sleep(5)
-        start_bot_safely()
+        return "N/A"
 
-# Flask Routes for Render
+def view_database_page(call, page_num):
+    """View database page for admin"""
+    uid = call.from_user.id
+    if uid != Config.ADMIN_ID:
+        bot.answer_callback_query(call.id, "⛔ Access Denied!")
+        return
+    
+    items_per_page = 10
+    offset = (page_num - 1) * items_per_page
+    
+    deployments = execute_db("""
+        SELECT d.id, d.bot_name, d.filename, d.status, u.username, 
+               d.last_active, d.node_id, d.auto_restart, d.restart_count
+        FROM deployments d 
+        LEFT JOIN users u ON d.user_id = u.id 
+        ORDER BY d.id DESC 
+        LIMIT ? OFFSET ?
+    """, (items_per_page, offset), fetchall=True) or []
+    
+    total_deployments = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)
+    if total_deployments:
+        total_deployments = total_deployments[0] or 0
+    else:
+        total_deployments = 0
+    
+    total_pages = (total_deployments + items_per_page - 1) // items_per_page
+    
+    text = f"""
+🗄️ **DATABASE VIEWER**
+━━━━━━━━━━━━━━━━━━━━
+📊 **Total Bots:** {total_deployments}
+📄 **Page:** {page_num}/{total_pages}
+━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    if deployments:
+        for dep in deployments:
+            status_icon = "🟢" if dep['status'] == "Running" else "🔴"
+            auto_icon = "🔁" if dep['auto_restart'] == 1 else "⏸️"
+            text += f"\n{status_icon}{auto_icon} **{dep['bot_name']}** (ID: {dep['id']})"
+            text += f"\n👤 User: @{dep['username'] or 'Unknown'}"
+            text += f"\n📁 File: `{dep['filename']}`"
+            text += f"\n📊 Status: {dep['status']}"
+            text += f"\n🌐 Node: {dep['node_id'] or 'N/A'}"
+            text += f"\n🔄 Restarts: {dep['restart_count']}"
+            text += f"\n📅 Last Active: {dep['last_active']}"
+            text += "\n━━━━━━━━━━━━━━━━━━━━\n"
+    else:
+        text += "\n📭 No bots found on this page\n"
+    
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    
+    if page_num > 1:
+        markup.add(types.InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{page_num-1}"))
+    
+    if page_num < total_pages:
+        markup.add(types.InlineKeyboardButton("Next ➡️", callback_data=f"page_{page_num+1}"))
+    
+    markup.add(types.InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel"))
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+# Additional Flask routes for web interface
 @app.route('/')
-def home():
+def index():
+    return "🤖 ZEN X Bot Hosting v3.3.2 - Auto-Recovery System Active"
+
+@app.route('/status')
+def status():
     stats = get_system_stats()
-    
     return jsonify({
-        "service": "ZEN X 300-CAPACITY HOST BOT v3.3.2",
-        "status": "running",
-        "version": "3.3.2",
-        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        'status': 'online',
+        'version': '3.3.2',
+        'auto_recovery': Config.AUTO_RESTART_BOTS,
+        'stats': stats
     })
 
-@app.route('/health')
-def health():
-    """Health check endpoint"""
-    try:
-        total_users = execute_db("SELECT COUNT(*) FROM users", fetchone=True)[0] or 0
-        total_bots = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)[0] or 0
-        running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE status='Running'", fetchone=True)[0] or 0
-        
-        return jsonify({
-            "status": "healthy",
-            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            "statistics": {
-                "total_users": total_users,
-                "total_bots": total_bots,
-                "running_bots": running_bots
-            }
+@app.route('/api/deployments')
+def get_deployments():
+    deployments = execute_db("""
+        SELECT d.id, d.bot_name, d.status, d.start_time, u.username, 
+               d.cpu_usage, d.ram_usage, d.restart_count
+        FROM deployments d
+        LEFT JOIN users u ON d.user_id = u.id
+        ORDER BY d.status DESC, d.id DESC
+        LIMIT 50
+    """, fetchall=True) or []
+    
+    result = []
+    for dep in deployments:
+        result.append({
+            'id': dep['id'],
+            'bot_name': dep['bot_name'],
+            'status': dep['status'],
+            'username': dep['username'],
+            'cpu_usage': dep['cpu_usage'],
+            'ram_usage': dep['ram_usage'],
+            'restart_count': dep['restart_count'],
+            'start_time': dep['start_time']
         })
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    
+    return jsonify({'deployments': result})
 
-@app.route('/stop_bot')
-def stop_bot_route():
-    """Stop bot instance (admin only)"""
-    # Simple admin check
-    auth_token = request.args.get('token')
-    if auth_token != str(Config.ADMIN_ID):
-        return jsonify({"status": "unauthorized"}), 401
+@app.route('/api/nodes')
+def get_nodes():
+    nodes = execute_db("SELECT * FROM nodes", fetchall=True) or []
     
-    return jsonify({
-        "status": "cannot_stop_in_web_service",
-        "message": "Bot runs as part of web service. Restart the service to stop.",
-        "instance_id": os.getpid()
-    })
+    result = []
+    for node in nodes:
+        result.append({
+            'id': node['id'],
+            'name': node['name'],
+            'status': node['status'],
+            'capacity': node['capacity'],
+            'current_load': node['current_load'],
+            'region': node['region'],
+            'total_deployed': node['total_deployed']
+        })
+    
+    return jsonify({'nodes': result})
 
-# Start Bot in separate thread
-def start_bot_thread():
-    """Start bot in separate thread"""
-    time.sleep(5)  # Wait for Flask to start
-    start_bot_safely()
+@app.route('/api/stats')
+def api_stats():
+    stats = get_system_stats()
+    return jsonify(stats)
 
-# Start Bot
-if __name__ == '__main__':
-    # Create necessary directories
-    for dir_name in [Config.PROJECT_DIR, Config.EXPORTS_DIR, Config.BACKUP_DIR, Config.LOGS_DIR]:
-        Path(dir_name).mkdir(exist_ok=True)
+# Auto-recovery thread
+def auto_recovery_thread():
+    """Auto-recovery thread to restart failed bots"""
+    while True:
+        try:
+            if Config.AUTO_RESTART_BOTS:
+                # Find bots with auto_restart enabled that are stopped
+                bots = execute_db("""
+                    SELECT id, pid, user_id, bot_name, filename, auto_restart, restart_count 
+                    FROM deployments 
+                    WHERE auto_restart=1 AND (status='Stopped' OR pid=0)
+                """, fetchall=True) or []
+                
+                for bot_info in bots:
+                    bot_id = bot_info['id']
+                    user_id = bot_info['user_id']
+                    bot_name = bot_info['bot_name']
+                    filename = bot_info['filename']
+                    
+                    # Check if bot file exists
+                    file_path = project_path / filename
+                    if not file_path.exists():
+                        continue
+                    
+                    # Check if already running
+                    if bot_info['pid']:
+                        try:
+                            os.kill(bot_info['pid'], 0)
+                            continue  # Still running
+                        except:
+                            pass
+                    
+                    # Assign to node
+                    node = assign_bot_to_node(user_id, bot_name)
+                    if not node:
+                        continue
+                    
+                    # Start the bot
+                    start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    logs_dir = Path('logs')
+                    logs_dir.mkdir(exist_ok=True)
+                    
+                    try:
+                        with open(f'logs/bot_{bot_id}.log', 'a') as log_file:
+                            log_file.write(f"\n{'='*50}\nAuto-Recovery at {start_time}\n{'='*50}\n")
+                            proc = subprocess.Popen(
+                                ['python', str(file_path)],
+                                stdout=log_file,
+                                stderr=subprocess.STDOUT,
+                                start_new_session=True
+                            )
+                        
+                        time.sleep(2)
+                        
+                        if proc.poll() is not None:
+                            continue
+                        
+                        # Update database
+                        execute_db("""
+                            UPDATE deployments 
+                            SET pid=?, start_time=?, status='Running', node_id=?, last_active=?, 
+                                restart_count=restart_count+1, updated_at=? 
+                            WHERE id=?
+                        """, (proc.pid, start_time, node['id'], start_time, start_time, bot_id), commit=True)
+                        
+                        execute_db("UPDATE nodes SET current_load=current_load+1 WHERE id=?", 
+                                  (node['id'],), commit=True)
+                        
+                        logger.info(f"Auto-recovered bot {bot_name} (ID: {bot_id})")
+                        send_notification(user_id, f"Bot '{bot_name}' auto-recovered")
+                        start_bot_monitoring(bot_id, proc.pid, user_id)
+                        
+                    except Exception as e:
+                        logger.error(f"Auto-recovery failed for bot {bot_id}: {e}")
+            
+            time.sleep(60)  # Check every minute
+            
+        except Exception as e:
+            logger.error(f"Auto-recovery thread error: {e}")
+            time.sleep(300)  # Wait 5 minutes on error
+
+# Cleanup thread
+def cleanup_thread():
+    """Cleanup old files and logs"""
+    while True:
+        try:
+            # Clean old log files (older than 7 days)
+            logs_dir = Path(Config.LOGS_DIR)
+            if logs_dir.exists():
+                for log_file in logs_dir.glob("*.log"):
+                    if (datetime.now() - datetime.fromtimestamp(log_file.stat().st_mtime)).days > 7:
+                        log_file.unlink()
+            
+            # Clean old export files (older than 1 day)
+            export_dir = Path(Config.EXPORTS_DIR)
+            if export_dir.exists():
+                for export_file in export_dir.glob("*.zip"):
+                    if (datetime.now() - datetime.fromtimestamp(export_file.stat().st_mtime)).days > 1:
+                        export_file.unlink()
+            
+            # Clean old temp files
+            for temp_file in project_path.glob("temp_*.zip"):
+                if (datetime.now() - datetime.fromtimestamp(temp_file.stat().st_mtime)).hours > 1:
+                    temp_file.unlink()
+            
+            # Clean old extracted directories
+            for extract_dir in project_path.glob("extracted_*"):
+                if (datetime.now() - datetime.fromtimestamp(extract_dir.stat().st_mtime)).hours > 1:
+                    import shutil
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+            
+            time.sleep(3600)  # Run every hour
+            
+        except Exception as e:
+            logger.error(f"Cleanup thread error: {e}")
+            time.sleep(7200)  # Wait 2 hours on error
+
+# Background threads starter
+def start_background_threads():
+    """Start all background threads"""
+    # Auto-recovery thread
+    recovery_thread = threading.Thread(target=auto_recovery_thread, daemon=True)
+    recovery_thread.start()
+    logger.info("Auto-recovery thread started")
     
-    print(f"""
-{'='*60}
-🤖 ZEN X 300-CAPACITY HOST BOT v3.3.2
-{'='*60}
-🚀 Starting server...
-• Instance ID: {os.getpid()}
-• Port: {Config.PORT}
-• Admin: @{Config.ADMIN_USERNAME}
-• Bot: @{Config.BOT_USERNAME}
-• Database: {Config.DB_NAME}
-• Auto-Recovery: {'ENABLED ✅' if Config.AUTO_RESTART_BOTS else 'DISABLED ❌'}
-{'='*60}
-    """)
+    # Cleanup thread
+    cleanup_thread_obj = threading.Thread(target=cleanup_thread, daemon=True)
+    cleanup_thread_obj.start()
+    logger.info("Cleanup thread started")
     
-    # Create initial backup
-    backup_path = backup_database()
-    if backup_path:
-        print(f"📦 Initial backup created: {backup_path.name}")
-    
-    # Start scheduled backups in background
+    # Backup scheduler thread
     backup_thread = threading.Thread(target=schedule_backups, daemon=True)
     backup_thread.start()
-    print("🔒 Scheduled backups enabled")
+    logger.info("Backup scheduler thread started")
+
+# Error handler
+@bot.message_handler(func=lambda message: True, content_types=['text', 'document', 'photo', 'audio', 'video', 'voice', 'sticker', 'location', 'contact'])
+def handle_all_messages(message):
+    try:
+        # Let the main handlers handle it
+        pass
+    except Exception as e:
+        logger.error(f"Unhandled error: {e}")
+        try:
+            bot.reply_to(message, "⚠️ An error occurred. Please try again.")
+        except:
+            pass
+
+# Main function
+def main():
+    """Main function to start the bot"""
+    logger.info("🤖 ZEN X Bot Hosting v3.3.2 Starting...")
+    logger.info(f"Admin ID: {Config.ADMIN_ID}")
+    logger.info(f"Bot Username: @{Config.BOT_USERNAME}")
     
-    # Recover previously running bots
+    # Create necessary directories
+    Path(Config.PROJECT_DIR).mkdir(exist_ok=True)
+    Path(Config.BACKUP_DIR).mkdir(exist_ok=True)
+    Path(Config.LOGS_DIR).mkdir(exist_ok=True)
+    Path(Config.EXPORTS_DIR).mkdir(exist_ok=True)
+    
+    # Initialize database
+    init_db()
+    
+    # Recover deployments on startup
     recover_deployments()
-    print("🔄 Auto-recovery system activated")
     
-    # Start bot in separate thread
-    bot_thread = threading.Thread(target=start_bot_thread, daemon=True)
-    bot_thread.start()
+    # Start background threads
+    start_background_threads()
     
-    print(f"✅ Telegram bot thread started")
-    print(f"🌐 Flask API server starting on port {Config.PORT}")
-    print(f"📊 Health check: http://0.0.0.0:{Config.PORT}/health")
-    print(f"{'='*60}")
-    print("📢 Use /start in Telegram bot to begin")
-    print(f"{'='*60}")
-    
-    # Start Flask app
-    app.run(
-        host='0.0.0.0',
-        port=Config.PORT,
-        debug=False,
-        use_reloader=False
+    # Start Flask web server in background
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host='0.0.0.0', port=Config.PORT, debug=False, use_reloader=False),
+        daemon=True
     )
+    flask_thread.start()
+    logger.info(f"Flask server started on port {Config.PORT}")
+    
+    # Send startup notification to admin
+    try:
+        stats = get_system_stats()
+        startup_msg = f"""
+🚀 **ZEN X HOST BOT v3.3.2 STARTED**
+━━━━━━━━━━━━━━━━━━━━
+*Auto-Recovery System: ACTIVE*
+━━━━━━━━━━━━━━━━━━━━
+📊 **System Stats:**
+• Users: {stats['total_users']}
+• Running Bots: {stats['running_bots']}
+• CPU: {stats['cpu_percent']:.1f}%
+• RAM: {stats['ram_percent']:.1f}%
+• Nodes: {len(Config.HOSTING_NODES)} x 300
+• Port: {Config.PORT}
+━━━━━━━━━━━━━━━━━━━━
+✅ Server is now online!
+"""
+        bot.send_message(Config.ADMIN_ID, startup_msg)
+    except Exception as e:
+        logger.error(f"Failed to send startup notification: {e}")
+    
+    # Start the bot
+    logger.info("Bot is now running...")
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=60)
+        except Exception as e:
+            logger.error(f"Bot polling error: {e}")
+            time.sleep(10)
+
+if __name__ == "__main__":
+    main()
