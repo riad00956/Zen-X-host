@@ -11,7 +11,6 @@ import random
 import platform
 import zipfile
 import json
-import asyncio
 import logging
 from pathlib import Path
 from telebot import types
@@ -31,9 +30,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global variable to track if bot is running
-bot_running = False
-current_bot_instance = None
+# Database lock for thread safety
+db_lock = threading.RLock()
 
 # ১. Configuration
 class Config:
@@ -75,12 +73,48 @@ project_path.mkdir(exist_ok=True)
 app = Flask(__name__)
 
 # Thread pool for concurrent operations
-executor = ThreadPoolExecutor(max_workers=10)
+executor = ThreadPoolExecutor(max_workers=5)
 
 # User session management
 user_sessions = {}
 user_message_history = {}
 bot_monitors = {}
+
+# Database helper functions with thread safety
+def get_db():
+    """Get database connection with thread safety"""
+    with db_lock:
+        conn = sqlite3.connect(Config.DB_NAME, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+def execute_db(query, params=(), fetchone=False, fetchall=False, commit=False):
+    """Execute database query with thread safety"""
+    with db_lock:
+        conn = sqlite3.connect(Config.DB_NAME, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        
+        try:
+            c.execute(query, params)
+            
+            if commit:
+                conn.commit()
+            
+            if fetchone:
+                result = c.fetchone()
+            elif fetchall:
+                result = c.fetchall()
+            else:
+                result = None
+            
+            conn.close()
+            return result
+            
+        except Exception as e:
+            logger.error(f"Database error: {e}")
+            conn.close()
+            return None
 
 # ২. Enhanced Database Functions with Auto-Recovery
 def init_db():
@@ -89,7 +123,7 @@ def init_db():
         # Check if database exists
         db_exists = os.path.exists(Config.DB_NAME)
         
-        conn = sqlite3.connect(Config.DB_NAME)
+        conn = get_db()
         c = conn.cursor()
         
         # Create tables if they don't exist
@@ -136,7 +170,6 @@ def init_db():
             expiry_date = (datetime.now() + timedelta(days=3650)).strftime('%Y-%m-%d %H:%M:%S')
             c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
                      (Config.ADMIN_ID, 'admin', expiry_date, 100, 1, join_date, join_date, 0, 0, join_date))
-            log_event("INIT", f"Admin user created: {Config.ADMIN_ID}", Config.ADMIN_ID)
         
         # Check if nodes exist
         c.execute("SELECT COUNT(*) FROM nodes")
@@ -148,13 +181,11 @@ def init_db():
             for i, node in enumerate(Config.HOSTING_NODES, 1):
                 c.execute("INSERT INTO nodes (name, status, capacity, last_check, region) VALUES (?, ?, ?, ?, ?)",
                          (node['name'], node['status'], node['capacity'], join_date, node.get('region', 'Global')))
-            log_event("INIT", f"Created {len(Config.HOSTING_NODES)} hosting nodes", Config.ADMIN_ID)
         
         # Update all running bots to "Stopped" status for recovery
         if db_exists:
             c.execute("UPDATE deployments SET status='Stopped', pid=0, updated_at=? WHERE status='Running'",
                      (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),))
-            log_event("RECOVERY", "Reset all running bots for recovery", Config.ADMIN_ID)
         
         conn.commit()
         conn.close()
@@ -170,25 +201,19 @@ def recover_deployments():
         return
     
     try:
-        conn = get_db()
-        c = conn.cursor()
-        
-        # Get all bots that were running before restart
-        running_bots = c.execute("""
+        result = execute_db("""
             SELECT d.*, u.username 
             FROM deployments d 
             LEFT JOIN users u ON d.user_id = u.id 
             WHERE d.auto_restart = 1 AND d.status IN ('Running', 'Restarting')
-        """).fetchall()
+        """, fetchall=True)
         
-        conn.close()
-        
-        if not running_bots:
+        if not result:
             return
         
-        logger.info(f"Found {len(running_bots)} bots to recover")
+        logger.info(f"Found {len(result)} bots to recover")
         
-        for bot_info in running_bots:
+        for bot_info in result:
             bot_id = bot_info['id']
             user_id = bot_info['user_id']
             bot_name = bot_info['bot_name']
@@ -199,7 +224,6 @@ def recover_deployments():
             file_path = project_path / filename
             if not file_path.exists():
                 logger.error(f"Bot file not found for recovery: {filename}")
-                log_event("RECOVERY_ERROR", f"Bot file not found: {filename}", user_id)
                 continue
             
             # Assign to node
@@ -224,30 +248,25 @@ def recover_deployments():
                     )
                 
                 # Update database
-                conn = get_db()
-                c = conn.cursor()
-                c.execute("""
+                execute_db("""
                     UPDATE deployments 
                     SET pid=?, start_time=?, status='Running', node_id=?, last_active=?, 
                     restart_count=restart_count+1, updated_at=? 
                     WHERE id=?
-                """, (proc.pid, start_time, node['id'], start_time, start_time, bot_id))
+                """, (proc.pid, start_time, node['id'], start_time, start_time, bot_id), commit=True)
                 
-                c.execute("UPDATE nodes SET current_load=current_load+1, total_deployed=total_deployed+1 WHERE id=?", (node['id'],))
-                conn.commit()
-                conn.close()
+                execute_db("UPDATE nodes SET current_load=current_load+1, total_deployed=total_deployed+1 WHERE id=?", 
+                          (node['id'],), commit=True)
                 
                 logger.info(f"Recovered bot {bot_name} (ID: {bot_id}) for user {username}")
-                log_event("RECOVERY_SUCCESS", f"Bot {bot_name} recovered successfully", user_id)
                 
                 # Start monitoring
                 start_bot_monitoring(bot_id, proc.pid, user_id)
                 
             except Exception as e:
                 logger.error(f"Failed to recover bot {bot_id}: {e}")
-                log_event("RECOVERY_FAILED", f"Failed to recover bot {bot_id}: {str(e)[:100]}", user_id)
         
-        log_event("RECOVERY_COMPLETE", f"Successfully recovered {len(running_bots)} bots", Config.ADMIN_ID)
+        logger.info(f"Successfully recovered {len(result)} bots")
         
     except Exception as e:
         logger.error(f"Error in deployment recovery: {e}")
@@ -255,39 +274,27 @@ def recover_deployments():
 def log_event(event, details, user_id=None):
     """Log server events"""
     try:
-        conn = sqlite3.connect(Config.DB_NAME)
-        c = conn.cursor()
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute("INSERT INTO server_logs (timestamp, event, details, user_id) VALUES (?, ?, ?, ?)",
-                 (timestamp, event, details, user_id))
-        conn.commit()
-        conn.close()
+        execute_db("INSERT INTO server_logs (timestamp, event, details, user_id) VALUES (?, ?, ?, ?)",
+                  (timestamp, event, details, user_id), commit=True)
     except Exception as e:
         logger.error(f"Error logging event: {e}")
 
 def log_bot_event(bot_id, log_type, message):
     """Log bot events"""
     try:
-        conn = sqlite3.connect(Config.DB_NAME)
-        c = conn.cursor()
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute("INSERT INTO bot_logs (bot_id, timestamp, log_type, message) VALUES (?, ?, ?, ?)",
-                 (bot_id, timestamp, log_type, message))
-        conn.commit()
-        conn.close()
+        execute_db("INSERT INTO bot_logs (bot_id, timestamp, log_type, message) VALUES (?, ?, ?, ?)",
+                  (bot_id, timestamp, log_type, message), commit=True)
     except Exception as e:
         logger.error(f"Error logging bot event: {e}")
 
 def send_notification(user_id, message):
     """Send notification to user"""
     try:
-        conn = sqlite3.connect(Config.DB_NAME)
-        c = conn.cursor()
         created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute("INSERT INTO notifications (user_id, message, created_at) VALUES (?, ?, ?)",
-                 (user_id, message, created_at))
-        conn.commit()
-        conn.close()
+        execute_db("INSERT INTO notifications (user_id, message, created_at) VALUES (?, ?, ?)",
+                  (user_id, message, created_at), commit=True)
         
         # Send immediate notification via Telegram if bot is active
         try:
@@ -300,11 +307,6 @@ def send_notification(user_id, message):
 # Initialize database
 init_db()
 
-def get_db():
-    conn = sqlite3.connect(Config.DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 # Backup Functions
 def backup_database():
     """Create a backup of the database"""
@@ -316,9 +318,10 @@ def backup_database():
         backup_filename = f"zenx_backup_{timestamp}.db"
         backup_path = backup_dir / backup_filename
         
-        # Copy database file
+        # Copy database file with lock
         import shutil
-        shutil.copy2(Config.DB_NAME, backup_path)
+        with db_lock:
+            shutil.copy2(Config.DB_NAME, backup_path)
         
         # Compress backup
         zip_filename = f"zenx_backup_{timestamp}.zip"
@@ -341,7 +344,6 @@ def backup_database():
                 pass
         
         logger.info(f"Database backup created: {zip_filename}")
-        log_event("BACKUP_CREATED", f"Backup created: {zip_filename}", Config.ADMIN_ID)
         return zip_path
         
     except Exception as e:
@@ -362,13 +364,10 @@ def schedule_backups():
 # System Monitoring Functions
 def get_system_stats():
     """Get system statistics"""
-    conn = get_db()
-    c = conn.cursor()
-    
-    total_bots = c.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
-    running_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE status='Running'").fetchone()[0]
-    total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    active_users = c.execute("SELECT COUNT(DISTINCT user_id) FROM deployments WHERE status='Running'").fetchone()[0]
+    total_bots = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)[0] or 0
+    running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE status='Running'", fetchone=True)[0] or 0
+    total_users = execute_db("SELECT COUNT(*) FROM users", fetchone=True)[0] or 0
+    active_users = execute_db("SELECT COUNT(DISTINCT user_id) FROM deployments WHERE status='Running'", fetchone=True)[0] or 0
     
     # Get last backup info
     backup_dir = Path(Config.BACKUP_DIR)
@@ -377,9 +376,7 @@ def get_system_stats():
     
     # Get total deployed today
     today = datetime.now().strftime('%Y-%m-%d')
-    deployed_today = c.execute("SELECT COUNT(*) FROM deployments WHERE DATE(created_at)=?", (today,)).fetchone()[0]
-    
-    conn.close()
+    deployed_today = execute_db("SELECT COUNT(*) FROM deployments WHERE DATE(created_at)=?", (today,), fetchone=True)[0] or 0
     
     stats = {
         'cpu_percent': random.randint(5, 40),
@@ -402,11 +399,7 @@ def get_system_stats():
 
 def get_available_nodes():
     """Get available hosting nodes"""
-    conn = get_db()
-    c = conn.cursor()
-    nodes = c.execute("SELECT * FROM nodes WHERE status='active'").fetchall()
-    conn.close()
-    return nodes
+    return execute_db("SELECT * FROM nodes WHERE status='active'", fetchall=True) or []
 
 def assign_bot_to_node(user_id, bot_name):
     """Assign bot to an available node"""
@@ -429,22 +422,14 @@ def assign_bot_to_node(user_id, bot_name):
 
 # Helper Functions
 def get_user(user_id):
-    conn = get_db()
-    c = conn.cursor()
-    user = c.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-    conn.close()
-    return user
+    return execute_db("SELECT * FROM users WHERE id=?", (user_id,), fetchone=True)
 
 def update_user_bot_count(user_id):
     """Update user's bot count"""
-    conn = get_db()
-    c = conn.cursor()
-    count = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=?", (user_id,)).fetchone()[0]
-    deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (user_id,)).fetchone()[0]
-    c.execute("UPDATE users SET total_bots_deployed=?, total_deployments=total_deployments+1 WHERE id=?", 
-              (count, user_id))
-    conn.commit()
-    conn.close()
+    count = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (user_id,), fetchone=True)[0] or 0
+    deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (user_id,), fetchone=True)[0] or 0
+    execute_db("UPDATE users SET total_bots_deployed=?, total_deployments=total_deployments+1 WHERE id=?", 
+              (count, user_id), commit=True)
 
 def is_prime(user_id):
     user = get_user(user_id)
@@ -457,26 +442,18 @@ def is_prime(user_id):
     return False
 
 def get_user_bots(user_id):
-    conn = get_db()
-    c = conn.cursor()
-    bots = c.execute("""
+    return execute_db("""
         SELECT id, bot_name, filename, pid, start_time, status, node_id, 
                restart_count, auto_restart, created_at 
         FROM deployments 
         WHERE user_id=? 
         ORDER BY status DESC, id DESC
-    """, (user_id,)).fetchall()
-    conn.close()
-    return bots
+    """, (user_id,), fetchall=True) or []
 
 def update_bot_stats(bot_id, cpu, ram):
-    conn = get_db()
-    c = conn.cursor()
     last_active = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    c.execute("UPDATE deployments SET cpu_usage=?, ram_usage=?, last_active=?, updated_at=? WHERE id=?", 
-             (cpu, ram, last_active, last_active, bot_id))
-    conn.commit()
-    conn.close()
+    execute_db("UPDATE deployments SET cpu_usage=?, ram_usage=?, last_active=?, updated_at=? WHERE id=?", 
+              (cpu, ram, last_active, last_active, bot_id), commit=True)
 
 def generate_random_key():
     prefix = "ZENX-"
@@ -515,8 +492,7 @@ def create_zip_file(bot_id, bot_name, filename, user_id):
                 'version': 'ZEN X HOST BOT v3.3.2',
                 'exported_by': 'ZEN X Bot Hosting System',
                 'node_info': '300-Capacity Multi-Node Hosting',
-                'recovery_info': 'Auto-recovery enabled',
-                'requirements': get_bot_requirements(bot_file_path)
+                'recovery_info': 'Auto-recovery enabled'
             }
             
             # Create metadata file in zip
@@ -527,28 +503,6 @@ def create_zip_file(bot_id, bot_name, filename, user_id):
     except Exception as e:
         logger.error(f"Error creating zip: {e}")
         return None
-
-def get_bot_requirements(file_path):
-    """Extract requirements from bot file"""
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-            
-        requirements = []
-        lines = content.split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            if line.startswith('import ') or line.startswith('from '):
-                parts = line.split()
-                if len(parts) >= 2:
-                    module = parts[1].split('.')[0]
-                    if module not in requirements and module not in ['sys', 'os', 'time', 'datetime', 'json', 'random']:
-                        requirements.append(module)
-        
-        return requirements[:10]
-    except:
-        return []
 
 def check_prime_expiry(user_id):
     """Check if prime has expired and return appropriate message"""
@@ -574,7 +528,7 @@ def check_prime_expiry(user_id):
                     'expired': True,
                     'days_expired': days_expired,
                     'expiry_date': expiry.strftime('%Y-%m-%d %H:%M:%S'),
-                    'message': f"Your Prime subscription expired {days_expired} day(s) ago. Please renew to continue using premium features."
+                    'message': f"Your Prime subscription expired {days_expired} day(s) ago."
                 }
         except:
             return {'expired': True, 'message': 'Invalid expiry date format'}
@@ -750,13 +704,9 @@ def handle_commands(message):
     # Register user if not exists
     user = get_user(uid)
     if not user:
-        conn = get_db()
-        c = conn.cursor()
         join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute("INSERT OR IGNORE INTO users (id, username, expiry, file_limit, is_prime, join_date, last_renewal, last_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
-                 (uid, username, None, 1, 0, join_date, None, join_date))
-        conn.commit()
-        conn.close()
+        execute_db("INSERT OR IGNORE INTO users (id, username, expiry, file_limit, is_prime, join_date, last_renewal, last_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
+                  (uid, username, None, 1, 0, join_date, None, join_date), commit=True)
         user = get_user(uid)
     
     clear_user_session(uid)
@@ -774,10 +724,8 @@ def handle_commands(message):
         plan = "Prime"
     
     # Check for notifications
-    conn = get_db()
-    c = conn.cursor()
-    unread_notifications = c.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (uid,)).fetchone()[0]
-    conn.close()
+    unread_notifications = execute_db("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", 
+                                     (uid,), fetchone=True)[0] or 0
     
     notification_badge = f" ({unread_notifications})" if unread_notifications > 0 else ""
     
@@ -988,11 +936,8 @@ def handle_deploy_new(message, last_msg_id=None):
         return
     
     # Get available files
-    conn = get_db()
-    c = conn.cursor()
-    files = c.execute("SELECT id, filename, bot_name FROM deployments WHERE user_id=? AND (pid=0 OR pid IS NULL OR status='Stopped')", 
-                     (uid,)).fetchall()
-    conn.close()
+    files = execute_db("SELECT id, filename, bot_name FROM deployments WHERE user_id=? AND (pid=0 OR pid IS NULL OR status='Stopped')", 
+                      (uid,), fetchall=True)
     
     if not files:
         text = "📭 **No files available for deployment**\n\nUpload a file first."
@@ -1045,11 +990,8 @@ def handle_dashboard(message, last_msg_id=None):
     used_capacity = sum(node['current_load'] for node in nodes)
     
     # Get user statistics
-    conn = get_db()
-    c = conn.cursor()
-    total_deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,)).fetchone()[0]
-    today_deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at)=DATE('now')", (uid,)).fetchone()[0]
-    conn.close()
+    total_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,), fetchone=True)[0] or 0
+    today_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at)=DATE('now')", (uid,), fetchone=True)[0] or 0
     
     text = f"""
 📊 **USER DASHBOARD v3.3.2**
@@ -1096,10 +1038,7 @@ def handle_settings(message, last_msg_id=None):
     prime_status = check_prime_expiry(uid)
     
     # Get user preferences
-    conn = get_db()
-    c = conn.cursor()
-    notifications = c.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (uid,)).fetchone()[0]
-    conn.close()
+    notifications = execute_db("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (uid,), fetchone=True)[0] or 0
     
     text = f"""
 ⚙️ **SETTINGS v3.3.2**
@@ -1137,9 +1076,7 @@ def handle_settings(message, last_msg_id=None):
 def handle_notifications(message, last_msg_id=None):
     uid = message.from_user.id
     
-    conn = get_db()
-    c = conn.cursor()
-    notifications = c.execute("SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,)).fetchall()
+    notifications = execute_db("SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,), fetchall=True)
     
     if not notifications:
         text = """
@@ -1149,7 +1086,6 @@ No notifications found.
 ━━━━━━━━━━━━━━━━━━━━
 """
         edit_or_send_message(message.chat.id, last_msg_id, text)
-        conn.close()
         return
     
     unread_count = sum(1 for n in notifications if n['is_read'] == 0)
@@ -1170,9 +1106,7 @@ No notifications found.
         text += f"\n... and {len(notifications) - 5} more notifications"
     
     # Mark all as read
-    c.execute("UPDATE notifications SET is_read=1 WHERE user_id=?", (uid,))
-    conn.commit()
-    conn.close()
+    execute_db("UPDATE notifications SET is_read=1 WHERE user_id=?", (uid,), commit=True)
     
     markup = types.InlineKeyboardMarkup()
     markup.add(
@@ -1185,25 +1119,20 @@ No notifications found.
 def handle_user_statistics(message, last_msg_id=None):
     uid = message.from_user.id
     
-    conn = get_db()
-    c = conn.cursor()
-    
     # Get user stats
-    total_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,)).fetchone()[0]
-    running_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (uid,)).fetchone()[0]
-    total_deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,)).fetchone()[0]
-    today_deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at)=DATE('now')", (uid,)).fetchone()[0]
+    total_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,), fetchone=True)[0] or 0
+    running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (uid,), fetchone=True)[0] or 0
+    total_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=?", (uid,), fetchone=True)[0] or 0
+    today_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at)=DATE('now')", (uid,), fetchone=True)[0] or 0
     
     # Get weekly stats
     week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-    weekly_deployments = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at) >= ?", 
-                                   (uid, week_ago)).fetchone()[0]
+    weekly_deployments = execute_db("SELECT COUNT(*) FROM deployments WHERE user_id=? AND DATE(created_at) >= ?", 
+                                   (uid, week_ago), fetchone=True)[0] or 0
     
     # Get bot types
-    bot_files = c.execute("SELECT filename, COUNT(*) as count FROM deployments WHERE user_id=? GROUP BY filename", 
-                         (uid,)).fetchall()
-    
-    conn.close()
+    bot_files = execute_db("SELECT filename, COUNT(*) as count FROM deployments WHERE user_id=? GROUP BY filename", 
+                          (uid,), fetchall=True) or []
     
     text = f"""
 📈 **USER STATISTICS**
@@ -1538,17 +1467,12 @@ def process_bot_name_input(message):
     original_name = session['original_name']
     
     # Save to database with auto_restart enabled by default
-    conn = get_db()
-    c = conn.cursor()
     created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    c.execute("INSERT INTO deployments (user_id, bot_name, filename, pid, start_time, status, last_active, auto_restart, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-             (uid, bot_name, filename, 0, None, "Uploaded", created_at, 1, created_at, created_at))
-    conn.commit()
+    execute_db("INSERT INTO deployments (user_id, bot_name, filename, pid, start_time, status, last_active, auto_restart, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              (uid, bot_name, filename, 0, None, "Uploaded", created_at, 1, created_at, created_at), commit=True)
     
     # Update user bot count
     update_user_bot_count(uid)
-    
-    conn.close()
     
     clear_user_session(uid)
     
@@ -1584,14 +1508,11 @@ def process_key_input(message):
     
     key_input = message.text.strip().upper()
     
-    conn = get_db()
-    c = conn.cursor()
-    res = c.execute("SELECT * FROM keys WHERE key=?", (key_input,)).fetchone()
+    res = execute_db("SELECT * FROM keys WHERE key=?", (key_input,), fetchone=True)
     
     if res:
         if res['is_used'] == 1:
             edit_or_send_message(chat_id, None, "❌ **Key already used!**\n\nThis key has already been activated.")
-            conn.close()
             return
             
         days, limit = res['duration_days'], res['file_limit']
@@ -1615,25 +1536,21 @@ def process_key_input(message):
         last_renewal = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         # Update user
-        c.execute("UPDATE users SET expiry=?, file_limit=?, is_prime=1, last_renewal=?, last_active=? WHERE id=?", 
-                 (expiry_date, limit, last_renewal, last_renewal, uid))
-        c.execute("UPDATE keys SET used_by=?, used_date=?, is_used=1 WHERE key=?", 
-                 (uid, last_renewal, key_input))
-        conn.commit()
+        execute_db("UPDATE users SET expiry=?, file_limit=?, is_prime=1, last_renewal=?, last_active=? WHERE id=?", 
+                  (expiry_date, limit, last_renewal, last_renewal, uid), commit=True)
+        execute_db("UPDATE keys SET used_by=?, used_date=?, is_used=1 WHERE key=?", 
+                  (uid, last_renewal, key_input), commit=True)
         
         # Stop all user bots if renewing after expiry
         if not (current_expiry and current_expiry > datetime.now()):
-            user_bots = c.execute("SELECT id, pid FROM deployments WHERE user_id=?", (uid,)).fetchall()
+            user_bots = execute_db("SELECT id, pid FROM deployments WHERE user_id=?", (uid,), fetchall=True) or []
             for bot in user_bots:
                 if bot['pid']:
                     try:
                         os.kill(bot['pid'], signal.SIGTERM)
                     except:
                         pass
-                c.execute("UPDATE deployments SET status='Stopped', pid=0 WHERE id=?", (bot['id'],))
-            conn.commit()
-        
-        conn.close()
+                execute_db("UPDATE deployments SET status='Stopped', pid=0 WHERE id=?", (bot['id'],), commit=True)
         
         text = f"""
 ✅ **PRIME {'RENEWED' if current_expiry and current_expiry > datetime.now() else 'ACTIVATED'}!**
@@ -1652,7 +1569,6 @@ Enjoy all prime features!
         edit_or_send_message(chat_id, None, text, reply_markup=get_main_keyboard(uid))
         send_notification(uid, f"Prime activated successfully! Expires on {expiry_date}")
     else:
-        conn.close()
         text = f"""
 ❌ **INVALID KEY**
 ━━━━━━━━━━━━━━━━━━━━
@@ -1763,12 +1679,8 @@ def process_limit_input(message):
         key = generate_random_key()
         created_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("INSERT INTO keys (key, duration_days, file_limit, created_date) VALUES (?, ?, ?, ?)", 
-                 (key, days, limit, created_date))
-        conn.commit()
-        conn.close()
+        execute_db("INSERT INTO keys (key, duration_days, file_limit, created_date) VALUES (?, ?, ?, ?)", 
+                  (key, days, limit, created_date), commit=True)
         
         clear_user_session(uid)
         
@@ -1821,10 +1733,7 @@ def process_broadcast_message(message):
     broadcast_text = message.text.strip()
     
     # Get all users
-    conn = get_db()
-    c = conn.cursor()
-    users = c.execute("SELECT id FROM users").fetchall()
-    conn.close()
+    users = execute_db("SELECT id FROM users", fetchall=True) or []
     
     total_users = len(users)
     success_count = 0
@@ -1883,13 +1792,10 @@ def process_user_id_input(message):
     try:
         target_user_id = int(message.text.strip())
         
-        conn = get_db()
-        c = conn.cursor()
-        user = c.execute("SELECT * FROM users WHERE id=?", (target_user_id,)).fetchone()
+        user = execute_db("SELECT * FROM users WHERE id=?", (target_user_id,), fetchone=True)
         
         if not user:
             edit_or_send_message(chat_id, None, "❌ User not found!")
-            conn.close()
             return
         
         username = user['username'] or f"User_{target_user_id}"
@@ -1899,10 +1805,8 @@ def process_user_id_input(message):
         total_bots = user['total_bots_deployed']
         
         # Get user's bots
-        bots = c.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status='Running' THEN 1 ELSE 0 END) as running FROM deployments WHERE user_id=?", 
-                        (target_user_id,)).fetchone()
-        
-        conn.close()
+        bots = execute_db("SELECT COUNT(*) as total, SUM(CASE WHEN status='Running' THEN 1 ELSE 0 END) as running FROM deployments WHERE user_id=?", 
+                         (target_user_id,), fetchone=True)
         
         text = f"""
 👤 **USER DETAILS**
@@ -2054,10 +1958,7 @@ def start_deployment(call, file_id):
     chat_id = call.message.chat.id
     message_id = call.message.message_id
     
-    conn = get_db()
-    c = conn.cursor()
-    bot_info = c.execute("SELECT id, bot_name, filename, auto_restart FROM deployments WHERE id=?", (file_id,)).fetchone()
-    conn.close()
+    bot_info = execute_db("SELECT id, bot_name, filename, auto_restart FROM deployments WHERE id=?", (file_id,), fetchone=True)
     
     if not bot_info:
         bot.answer_callback_query(call.id, "❌ Bot not found!")
@@ -2130,16 +2031,12 @@ Check your bot code and try again.
             return
         
         # Update database
-        conn = get_db()
-        c = conn.cursor()
         updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute("UPDATE deployments SET pid=?, start_time=?, status='Running', node_id=?, last_active=?, updated_at=? WHERE id=?", 
-                 (proc.pid, start_time, node['id'], start_time, updated_at, bot_id))
+        execute_db("UPDATE deployments SET pid=?, start_time=?, status='Running', node_id=?, last_active=?, updated_at=? WHERE id=?", 
+                  (proc.pid, start_time, node['id'], start_time, updated_at, bot_id), commit=True)
         
         # Update node load
-        c.execute("UPDATE nodes SET current_load=current_load+1, total_deployed=total_deployed+1 WHERE id=?", (node['id'],))
-        conn.commit()
-        conn.close()
+        execute_db("UPDATE nodes SET current_load=current_load+1, total_deployed=total_deployed+1 WHERE id=?", (node['id'],), commit=True)
         
         log_event("DEPLOY", f"Bot {bot_name} (ID: {bot_id}) deployed to {node['name']}", uid)
         log_bot_event(bot_id, "DEPLOY_SUCCESS", f"Deployed to {node['name']}")
@@ -2188,26 +2085,19 @@ def start_bot_monitoring(bot_id, pid, user_id):
                     os.kill(pid, 0)
                 except OSError:
                     # Process died
-                    conn = get_db()
-                    c = conn.cursor()
-                    bot_info = c.execute("SELECT bot_name, auto_restart FROM deployments WHERE id=?", (bot_id,)).fetchone()
+                    bot_info = execute_db("SELECT bot_name, auto_restart FROM deployments WHERE id=?", (bot_id,), fetchone=True)
                     
                     if bot_info and bot_info['auto_restart'] == 1:
                         # Auto-restart enabled
                         updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        c.execute("UPDATE deployments SET status='Restarting', restart_count=restart_count+1, updated_at=? WHERE id=?", 
-                                 (updated_at, bot_id))
-                        conn.commit()
-                        conn.close()
+                        execute_db("UPDATE deployments SET status='Restarting', restart_count=restart_count+1, updated_at=? WHERE id=?", 
+                                  (updated_at, bot_id), commit=True)
                         
                         # Wait and try to restart
                         time.sleep(5)
                         
                         # Find and restart the bot
-                        conn = get_db()
-                        c = conn.cursor()
-                        bot_data = c.execute("SELECT filename FROM deployments WHERE id=?", (bot_id,)).fetchone()
-                        conn.close()
+                        bot_data = execute_db("SELECT filename FROM deployments WHERE id=?", (bot_id,), fetchone=True)
                         
                         if bot_data:
                             file_path = project_path / bot_data['filename']
@@ -2222,12 +2112,8 @@ def start_bot_monitoring(bot_id, pid, user_id):
                                         start_new_session=True
                                     )
                                 
-                                conn = get_db()
-                                c = conn.cursor()
-                                c.execute("UPDATE deployments SET pid=?, start_time=?, status='Running', last_active=? WHERE id=?", 
-                                         (new_proc.pid, start_time_new, start_time_new, bot_id))
-                                conn.commit()
-                                conn.close()
+                                execute_db("UPDATE deployments SET pid=?, start_time=?, status='Running', last_active=? WHERE id=?", 
+                                          (new_proc.pid, start_time_new, start_time_new, bot_id), commit=True)
                                 
                                 pid = new_proc.pid
                                 log_bot_event(bot_id, "AUTO_RESTART", "Bot auto-restarted")
@@ -2235,16 +2121,12 @@ def start_bot_monitoring(bot_id, pid, user_id):
                                 continue
                     
                     # Mark as stopped
-                    conn = get_db()
-                    c = conn.cursor()
                     updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    c.execute("UPDATE deployments SET status='Stopped', pid=0, last_active=?, updated_at=? WHERE id=?", 
-                             (updated_at, updated_at, bot_id))
+                    execute_db("UPDATE deployments SET status='Stopped', pid=0, last_active=?, updated_at=? WHERE id=?", 
+                              (updated_at, updated_at, bot_id), commit=True)
                     
                     # Update node load
-                    c.execute("UPDATE nodes SET current_load=current_load-1 WHERE id=(SELECT node_id FROM deployments WHERE id=?)", (bot_id,))
-                    conn.commit()
-                    conn.close()
+                    execute_db("UPDATE nodes SET current_load=current_load-1 WHERE id=(SELECT node_id FROM deployments WHERE id=?)", (bot_id,), commit=True)
                     
                     log_bot_event(bot_id, "PROCESS_STOPPED", "Bot process stopped")
                     break
@@ -2270,9 +2152,7 @@ def stop_bot(call, bot_id):
     uid = call.from_user.id
     chat_id = call.message.chat.id
     
-    conn = get_db()
-    c = conn.cursor()
-    bot_info = c.execute("SELECT pid, node_id, bot_name FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    bot_info = execute_db("SELECT pid, node_id, bot_name FROM deployments WHERE id=?", (bot_id,), fetchone=True)
     
     if bot_info and bot_info['pid']:
         pid = bot_info['pid']
@@ -2285,13 +2165,10 @@ def stop_bot(call, bot_id):
             pass
     
     last_active = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    c.execute("UPDATE deployments SET status='Stopped', pid=0, last_active=?, updated_at=? WHERE id=?", (last_active, last_active, bot_id))
+    execute_db("UPDATE deployments SET status='Stopped', pid=0, last_active=?, updated_at=? WHERE id=?", (last_active, last_active, bot_id), commit=True)
     
     if bot_info and bot_info['node_id']:
-        c.execute("UPDATE nodes SET current_load=current_load-1 WHERE id=?", (bot_info['node_id'],))
-    
-    conn.commit()
-    conn.close()
+        execute_db("UPDATE nodes SET current_load=current_load-1 WHERE id=?", (bot_info['node_id'],), commit=True)
     
     log_event("STOP", f"Bot {bot_info['bot_name']} (ID: {bot_id}) stopped", uid)
     log_bot_event(bot_id, "MANUAL_STOP", "Bot stopped by user")
@@ -2305,9 +2182,7 @@ def restart_bot(call, bot_id):
     chat_id = call.message.chat.id
     
     # First stop
-    conn = get_db()
-    c = conn.cursor()
-    bot_info = c.execute("SELECT pid, node_id, filename, bot_name FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    bot_info = execute_db("SELECT pid, node_id, filename, bot_name FROM deployments WHERE id=?", (bot_id,), fetchone=True)
     
     if bot_info and bot_info['pid']:
         try:
@@ -2316,10 +2191,8 @@ def restart_bot(call, bot_id):
         except:
             pass
     
-    c.execute("UPDATE deployments SET status='Restarting', restart_count=restart_count+1, updated_at=? WHERE id=?", 
-             (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), bot_id))
-    conn.commit()
-    conn.close()
+    execute_db("UPDATE deployments SET status='Restarting', restart_count=restart_count+1, updated_at=? WHERE id=?", 
+              (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), bot_id), commit=True)
     
     log_event("RESTART", f"Bot {bot_info['bot_name']} (ID: {bot_id}) restarting", uid)
     
@@ -2330,14 +2203,11 @@ def restart_bot(call, bot_id):
     start_deployment(call, bot_id)
 
 def toggle_auto_restart(call, bot_id):
-    conn = get_db()
-    c = conn.cursor()
-    bot_info = c.execute("SELECT bot_name, auto_restart FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    bot_info = execute_db("SELECT bot_name, auto_restart FROM deployments WHERE id=?", (bot_id,), fetchone=True)
     
     if bot_info:
         new_status = 0 if bot_info['auto_restart'] == 1 else 1
-        c.execute("UPDATE deployments SET auto_restart=? WHERE id=?", (new_status, bot_id))
-        conn.commit()
+        execute_db("UPDATE deployments SET auto_restart=? WHERE id=?", (new_status, bot_id), commit=True)
         
         status_text = "ENABLED ✅" if new_status == 1 else "DISABLED ❌"
         bot.answer_callback_query(call.id, f"Auto-restart {status_text} for {bot_info['bot_name']}")
@@ -2345,22 +2215,17 @@ def toggle_auto_restart(call, bot_id):
         log_event("AUTO_RESTART_TOGGLE", f"Bot {bot_info['bot_name']} auto-restart set to {status_text}", call.from_user.id)
         send_notification(call.from_user.id, f"Auto-restart {status_text.lower()} for bot '{bot_info['bot_name']}'")
     
-    conn.close()
     show_bot_details(call, bot_id)
 
 def show_bot_stats(call, bot_id):
-    conn = get_db()
-    c = conn.cursor()
-    bot_info = c.execute("SELECT * FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    bot_info = execute_db("SELECT * FROM deployments WHERE id=?", (bot_id,), fetchone=True)
     
     if not bot_info:
         bot.answer_callback_query(call.id, "❌ Bot not found!")
         return
     
     # Get bot logs
-    logs = c.execute("SELECT * FROM bot_logs WHERE bot_id=? ORDER BY id DESC LIMIT 10", (bot_id,)).fetchall()
-    
-    conn.close()
+    logs = execute_db("SELECT * FROM bot_logs WHERE bot_id=? ORDER BY id DESC LIMIT 10", (bot_id,), fetchall=True) or []
     
     bot_name = bot_info['bot_name']
     restart_count = bot_info['restart_count']
@@ -2394,10 +2259,7 @@ def show_bot_stats(call, bot_id):
     bot.answer_callback_query(call.id, "📊 Statistics sent!")
 
 def export_bot(call, bot_id):
-    conn = get_db()
-    c = conn.cursor()
-    bot_info = c.execute("SELECT bot_name, filename, user_id FROM deployments WHERE id=?", (bot_id,)).fetchone()
-    conn.close()
+    bot_info = execute_db("SELECT bot_name, filename, user_id FROM deployments WHERE id=?", (bot_id,), fetchone=True)
     
     if not bot_info:
         bot.answer_callback_query(call.id, "❌ Bot not found!")
@@ -2422,10 +2284,7 @@ def export_bot(call, bot_id):
         bot.answer_callback_query(call.id, "❌ Error creating export!")
 
 def show_bot_details(call, bot_id):
-    conn = get_db()
-    c = conn.cursor()
-    bot_info = c.execute("SELECT * FROM deployments WHERE id=?", (bot_id,)).fetchone()
-    conn.close()
+    bot_info = execute_db("SELECT * FROM deployments WHERE id=?", (bot_id,), fetchone=True)
     
     if not bot_info:
         return
@@ -2453,10 +2312,7 @@ def show_bot_details(call, bot_id):
     is_running = get_process_stats(pid) if pid else False
     
     # Get node info
-    conn = get_db()
-    c = conn.cursor()
-    node_info = c.execute("SELECT name, region FROM nodes WHERE id=?", (node_id,)).fetchone() if node_id else None
-    conn.close()
+    node_info = execute_db("SELECT name, region FROM nodes WHERE id=?", (node_id,), fetchone=True) if node_id else None
     
     node_text = f"{node_info['name']} ({node_info['region']})" if node_info else "N/A"
     
@@ -2499,10 +2355,7 @@ def show_bot_logs(call, bot_id):
             logs = logs[-1500:] + "\n\n... (truncated, view full logs in file)"
         
         # Get bot name
-        conn = get_db()
-        c = conn.cursor()
-        bot_name = c.execute("SELECT bot_name FROM deployments WHERE id=?", (bot_id,)).fetchone()['bot_name']
-        conn.close()
+        bot_name = execute_db("SELECT bot_name FROM deployments WHERE id=?", (bot_id,), fetchone=True)['bot_name']
         
         text = f"""
 📜 **BOT LOGS: {bot_name}**
@@ -2516,10 +2369,7 @@ def show_bot_logs(call, bot_id):
         bot.answer_callback_query(call.id, f"❌ Error reading logs: {str(e)[:50]}")
 
 def confirm_delete_bot(call, bot_id):
-    conn = get_db()
-    c = conn.cursor()
-    bot_info = c.execute("SELECT bot_name, filename FROM deployments WHERE id=?", (bot_id,)).fetchone()
-    conn.close()
+    bot_info = execute_db("SELECT bot_name, filename FROM deployments WHERE id=?", (bot_id,), fetchone=True)
     
     if not bot_info:
         return
@@ -2544,9 +2394,7 @@ def confirm_delete_action(call, bot_id):
     uid = call.from_user.id
     chat_id = call.message.chat.id
     
-    conn = get_db()
-    c = conn.cursor()
-    bot_info = c.execute("SELECT filename, pid, node_id, bot_name FROM deployments WHERE id=?", (bot_id,)).fetchone()
+    bot_info = execute_db("SELECT filename, pid, node_id, bot_name FROM deployments WHERE id=?", (bot_id,), fetchone=True)
     
     if bot_info:
         filename, pid, node_id, bot_name = bot_info
@@ -2565,23 +2413,19 @@ def confirm_delete_action(call, bot_id):
         
         # Update node load
         if node_id:
-            c.execute("UPDATE nodes SET current_load=current_load-1 WHERE id=?", (node_id,))
+            execute_db("UPDATE nodes SET current_load=current_load-1 WHERE id=?", (node_id,), commit=True)
         
         # Delete from database
-        c.execute("DELETE FROM deployments WHERE id=?", (bot_id,))
+        execute_db("DELETE FROM deployments WHERE id=?", (bot_id,), commit=True)
         
         # Delete bot logs
-        c.execute("DELETE FROM bot_logs WHERE bot_id=?", (bot_id,))
+        execute_db("DELETE FROM bot_logs WHERE bot_id=?", (bot_id,), commit=True)
         
         # Update user bot count
         update_user_bot_count(uid)
         
-        conn.commit()
-        
         log_event("DELETE", f"Bot {bot_name} (ID: {bot_id}) deleted", uid)
         send_notification(uid, f"Bot '{bot_name}' deleted")
-    
-    conn.close()
     
     bot.answer_callback_query(call.id, "✅ Bot deleted successfully!")
     handle_my_bots(call.message, call.message.message_id)
@@ -2589,11 +2433,7 @@ def confirm_delete_action(call, bot_id):
 def clear_notifications(call):
     uid = call.from_user.id
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM notifications WHERE user_id=?", (uid,))
-    conn.commit()
-    conn.close()
+    execute_db("DELETE FROM notifications WHERE user_id=?", (uid,), commit=True)
     
     bot.answer_callback_query(call.id, "✅ Notifications cleared!")
     handle_notifications(call.message, call.message.message_id)
@@ -2685,10 +2525,7 @@ Type 'cancel' to abort.
     bot.register_next_step_handler(msg, process_duration_input)
 
 def show_all_users_admin(message, last_msg_id=None):
-    conn = get_db()
-    c = conn.cursor()
-    users = c.execute("SELECT id, username, expiry, file_limit, is_prime, join_date, total_bots_deployed, total_deployments FROM users ORDER BY id DESC").fetchall()
-    conn.close()
+    users = execute_db("SELECT id, username, expiry, file_limit, is_prime, join_date, total_bots_deployed, total_deployments FROM users ORDER BY id DESC", fetchall=True) or []
     
     prime_count = sum(1 for u in users if u['is_prime'] == 1)
     total_count = len(users)
@@ -2718,15 +2555,12 @@ def show_all_users_admin(message, last_msg_id=None):
     edit_or_send_message(message.chat.id, last_msg_id, text, reply_markup=markup)
 
 def show_all_bots_admin(message, last_msg_id=None):
-    conn = get_db()
-    c = conn.cursor()
-    bots = c.execute("""
+    bots = execute_db("""
         SELECT d.id, d.bot_name, d.status, d.start_time, u.username, d.auto_restart, d.restart_count 
         FROM deployments d 
         LEFT JOIN users u ON d.user_id = u.id 
         ORDER BY d.id DESC LIMIT 20
-    """).fetchall()
-    conn.close()
+    """, fetchall=True) or []
     
     running_bots = sum(1 for b in bots if b['status'] == "Running")
     auto_restart_bots = sum(1 for b in bots if b['auto_restart'] == 1)
@@ -2755,23 +2589,18 @@ def show_all_bots_admin(message, last_msg_id=None):
     edit_or_send_message(message.chat.id, last_msg_id, text)
 
 def show_admin_stats(message, last_msg_id=None):
-    conn = get_db()
-    c = conn.cursor()
-    
-    total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    prime_users = c.execute("SELECT COUNT(*) FROM users WHERE is_prime=1").fetchone()[0]
-    total_bots = c.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
-    running_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE status='Running'").fetchone()[0]
-    auto_restart_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE auto_restart=1").fetchone()[0]
-    total_keys = c.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
-    used_keys = c.execute("SELECT COUNT(*) FROM keys WHERE is_used=1").fetchone()[0]
+    total_users = execute_db("SELECT COUNT(*) FROM users", fetchone=True)[0] or 0
+    prime_users = execute_db("SELECT COUNT(*) FROM users WHERE is_prime=1", fetchone=True)[0] or 0
+    total_bots = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)[0] or 0
+    running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE status='Running'", fetchone=True)[0] or 0
+    auto_restart_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE auto_restart=1", fetchone=True)[0] or 0
+    total_keys = execute_db("SELECT COUNT(*) FROM keys", fetchone=True)[0] or 0
+    used_keys = execute_db("SELECT COUNT(*) FROM keys WHERE is_used=1", fetchone=True)[0] or 0
     
     # Today's stats
     today = datetime.now().strftime('%Y-%m-%d')
-    new_users_today = c.execute("SELECT COUNT(*) FROM users WHERE DATE(join_date)=?", (today,)).fetchone()[0]
-    deployments_today = c.execute("SELECT COUNT(*) FROM deployments WHERE DATE(created_at)=?", (today,)).fetchone()[0]
-    
-    conn.close()
+    new_users_today = execute_db("SELECT COUNT(*) FROM users WHERE DATE(join_date)=?", (today,), fetchone=True)[0] or 0
+    deployments_today = execute_db("SELECT COUNT(*) FROM deployments WHERE DATE(created_at)=?", (today,), fetchone=True)[0] or 0
     
     stats = get_system_stats()
     cpu_usage = stats['cpu_percent']
@@ -2831,21 +2660,16 @@ def view_database_page_admin(message, page_num, last_msg_id=None):
     items_per_page = 5
     offset = (page_num - 1) * items_per_page
     
-    conn = get_db()
-    c = conn.cursor()
-    
-    deployments = c.execute("""
+    deployments = execute_db("""
         SELECT d.id, d.bot_name, d.filename, d.status, u.username, d.last_active, d.node_id, d.auto_restart, d.restart_count
         FROM deployments d 
         LEFT JOIN users u ON d.user_id = u.id 
         ORDER BY d.id DESC
         LIMIT ? OFFSET ?
-    """, (items_per_page, offset)).fetchall()
+    """, (items_per_page, offset), fetchall=True) or []
     
-    total_deployments = c.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
+    total_deployments = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)[0] or 0
     total_pages = (total_deployments + items_per_page - 1) // items_per_page
-    
-    conn.close()
     
     text = f"""
 🗄️ **DATABASE VIEWER**
@@ -2920,10 +2744,7 @@ Only admin can access the system when enabled.
     log_event("MAINTENANCE_TOGGLE", f"Maintenance mode {status}", message.from_user.id)
 
 def show_nodes_status(message, last_msg_id=None):
-    conn = get_db()
-    c = conn.cursor()
-    nodes = c.execute("SELECT * FROM nodes").fetchall()
-    conn.close()
+    nodes = execute_db("SELECT * FROM nodes", fetchall=True) or []
     
     total_capacity = sum(node['capacity'] for node in nodes)
     used_capacity = sum(node['current_load'] for node in nodes)
@@ -2969,10 +2790,7 @@ Type 'cancel' to abort.
     edit_or_send_message(message.chat.id, last_msg_id, text)
 
 def show_server_logs_count(message, count=10):
-    conn = get_db()
-    c = conn.cursor()
-    logs = c.execute("SELECT * FROM server_logs ORDER BY id DESC LIMIT ?", (count,)).fetchall()
-    conn.close()
+    logs = execute_db("SELECT * FROM server_logs ORDER BY id DESC LIMIT ?", (count,), fetchall=True) or []
     
     text = f"""
 🔧 **SERVER LOGS (Last {len(logs)} entries)**
@@ -3046,20 +2864,17 @@ def cleanup_system(message, last_msg_id=None):
     uid = message.from_user.id
     
     try:
-        conn = get_db()
-        c = conn.cursor()
-        
         # Clean old notifications (older than 30 days)
         month_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-        deleted_notifications = c.execute("DELETE FROM notifications WHERE created_at < ?", (month_ago,)).rowcount
+        deleted_notifications = execute_db("DELETE FROM notifications WHERE created_at < ?", (month_ago,), commit=True)
         
         # Clean old server logs (older than 7 days)
         week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-        deleted_logs = c.execute("DELETE FROM server_logs WHERE timestamp < ?", (week_ago,)).rowcount
+        deleted_logs = execute_db("DELETE FROM server_logs WHERE timestamp < ?", (week_ago,), commit=True)
         
         # Clean old bot logs (older than 14 days)
         two_weeks_ago = (datetime.now() - timedelta(days=14)).strftime('%Y-%m-%d %H:%M:%S')
-        deleted_bot_logs = c.execute("DELETE FROM bot_logs WHERE timestamp < ?", (two_weeks_ago,)).rowcount
+        deleted_bot_logs = execute_db("DELETE FROM bot_logs WHERE timestamp < ?", (two_weeks_ago,), commit=True)
         
         # Clean old exports (older than 7 days)
         export_dir = Path(Config.EXPORTS_DIR)
@@ -3069,9 +2884,6 @@ def cleanup_system(message, last_msg_id=None):
                 if (datetime.now() - datetime.fromtimestamp(file.stat().st_mtime)).days > 7:
                     file.unlink()
                     deleted_exports += 1
-        
-        conn.commit()
-        conn.close()
         
         text = f"""
 🔄 **SYSTEM CLEANUP COMPLETED**
@@ -3101,11 +2913,8 @@ def message_user(call, user_id):
 
 def view_user_bots(call, user_id):
     """View all bots of a specific user"""
-    conn = get_db()
-    c = conn.cursor()
-    user = c.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()
-    bots = c.execute("SELECT * FROM deployments WHERE user_id=? ORDER BY status DESC, id DESC", (user_id,)).fetchall()
-    conn.close()
+    user = execute_db("SELECT username FROM users WHERE id=?", (user_id,), fetchone=True)
+    bots = execute_db("SELECT * FROM deployments WHERE user_id=? ORDER BY status DESC, id DESC", (user_id,), fetchall=True) or []
     
     username = user['username'] if user else f"User_{user_id}"
     
@@ -3131,12 +2940,7 @@ def view_user_bots(call, user_id):
 
 def reset_user_limit(call, user_id):
     """Reset user's file limit"""
-    conn = get_db()
-    c = conn.cursor()
-    
-    c.execute("UPDATE users SET file_limit=1 WHERE id=?", (user_id,))
-    conn.commit()
-    conn.close()
+    execute_db("UPDATE users SET file_limit=1 WHERE id=?", (user_id,), commit=True)
     
     bot.answer_callback_query(call.id, f"✅ User {user_id} file limit reset to 1!")
     log_event("RESET_LIMIT", f"User {user_id} file limit reset", call.from_user.id)
@@ -3186,92 +2990,32 @@ def extract_zip_file(zip_path, extract_to):
 # 409 Error Fix - Single Instance Bot Polling
 def start_bot_safely():
     """Start bot with single instance protection"""
-    global bot_running, current_bot_instance
+    # Remove any existing webhook first
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+    except:
+        pass
     
-    if bot_running:
-        logger.warning("Bot is already running, skipping...")
-        return
-    
-    # Create instance lock file
-    lock_file = Path('bot_instance.lock')
-    current_pid = os.getpid()
+    logger.info("Starting bot polling...")
     
     try:
-        if lock_file.exists():
-            # Check if lock is old (more than 5 minutes)
-            lock_time = lock_file.stat().st_mtime
-            if time.time() - lock_time > 300:  # 5 minutes
-                lock_file.unlink()
-                logger.info("Removed stale lock file")
-            else:
-                logger.warning("Another bot instance is running (lock file exists)")
-                return
+        # Set last_update_id to 0 to avoid NoneType error
+        bot.last_update_id = 0
         
-        # Create lock file
-        lock_file.write_text(str(current_pid))
-        bot_running = True
-        current_bot_instance = current_pid
-        
-        logger.info(f"Starting bot polling (PID: {current_pid})...")
-        
-        # Start polling with retry logic
-        retry_count = 0
-        max_retries = 3
-        
-        while bot_running and retry_count < max_retries:
-            try:
-                logger.info(f"Bot polling attempt {retry_count + 1}/{max_retries}")
-                bot.polling(
-                    none_stop=True,
-                    timeout=30,
-                    skip_pending=True,  # Skip pending updates
-                    interval=1  # Polling interval
-                )
-                break
-            except telebot.apihelper.ApiTelegramException as e:
-                if "409" in str(e):
-                    logger.warning(f"409 Conflict detected (attempt {retry_count + 1})")
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        wait_time = retry_count * 10  # Increasing wait time
-                        logger.info(f"Waiting {wait_time} seconds before retry...")
-                        time.sleep(wait_time)
-                        
-                        # Clear pending updates
-                        try:
-                            bot.skip_pending = True
-                            bot.last_update_id = None
-                        except:
-                            pass
-                    else:
-                        logger.error("Max retries reached for 409 conflict")
-                        break
-                elif "401" in str(e):
-                    logger.error("Invalid bot token. Please check BOT_TOKEN.")
-                    break
-                else:
-                    logger.error(f"Telegram API error: {e}")
-                    break
-            except Exception as e:
-                logger.error(f"General polling error: {e}")
-                break
-        
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        # Start polling with safe parameters
+        bot.polling(
+            none_stop=True,
+            timeout=60,
+            skip_pending=True,
+            interval=2,
+            allowed_updates=[]
+        )
     except Exception as e:
-        logger.error(f"Critical error in bot polling: {e}")
-    finally:
-        bot_running = False
-        # Clean up lock file if we created it
-        if lock_file.exists():
-            try:
-                lock_file_content = lock_file.read_text()
-                if lock_file_content == str(current_pid):
-                    lock_file.unlink()
-                    logger.info("Lock file removed")
-            except:
-                pass
-        logger.info("Bot instance stopped")
+        logger.error(f"Bot polling error: {e}")
+        # Wait and retry
+        time.sleep(5)
+        start_bot_safely()
 
 # Flask Routes for Render
 @app.route('/')
@@ -3282,8 +3026,6 @@ def home():
         "service": "ZEN X 300-CAPACITY HOST BOT v3.3.2",
         "status": "running",
         "version": "3.3.2",
-        "instance_id": os.getpid(),
-        "bot_running": bot_running,
         "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     })
 
@@ -3291,19 +3033,12 @@ def home():
 def health():
     """Health check endpoint"""
     try:
-        conn = get_db()
-        c = conn.cursor()
-        
-        total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        total_bots = c.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
-        running_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE status='Running'").fetchone()[0]
-        
-        conn.close()
+        total_users = execute_db("SELECT COUNT(*) FROM users", fetchone=True)[0] or 0
+        total_bots = execute_db("SELECT COUNT(*) FROM deployments", fetchone=True)[0] or 0
+        running_bots = execute_db("SELECT COUNT(*) FROM deployments WHERE status='Running'", fetchone=True)[0] or 0
         
         return jsonify({
             "status": "healthy",
-            "bot_running": bot_running,
-            "instance_id": os.getpid(),
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "statistics": {
                 "total_users": total_users,
@@ -3317,20 +3052,22 @@ def health():
 @app.route('/stop_bot')
 def stop_bot_route():
     """Stop bot instance (admin only)"""
-    global bot_running
-    
     # Simple admin check
     auth_token = request.args.get('token')
     if auth_token != str(Config.ADMIN_ID):
         return jsonify({"status": "unauthorized"}), 401
     
-    bot_running = False
-    
     return jsonify({
-        "status": "stopping",
-        "message": "Bot instance stopping...",
+        "status": "cannot_stop_in_web_service",
+        "message": "Bot runs as part of web service. Restart the service to stop.",
         "instance_id": os.getpid()
     })
+
+# Start Bot in separate thread
+def start_bot_thread():
+    """Start bot in separate thread"""
+    time.sleep(5)  # Wait for Flask to start
+    start_bot_safely()
 
 # Start Bot
 if __name__ == '__main__':
@@ -3347,14 +3084,10 @@ if __name__ == '__main__':
 • Port: {Config.PORT}
 • Admin: @{Config.ADMIN_USERNAME}
 • Bot: @{Config.BOT_USERNAME}
-• Single Instance Protection: ENABLED ✅
+• Database: {Config.DB_NAME}
 • Auto-Recovery: {'ENABLED ✅' if Config.AUTO_RESTART_BOTS else 'DISABLED ❌'}
-• 409 Conflict Fix: IMPLEMENTED ✅
 {'='*60}
     """)
-    
-    # Initialize database
-    init_db()
     
     # Create initial backup
     backup_path = backup_database()
@@ -3371,13 +3104,12 @@ if __name__ == '__main__':
     print("🔄 Auto-recovery system activated")
     
     # Start bot in separate thread
-    bot_thread = threading.Thread(target=start_bot_safely, daemon=True)
+    bot_thread = threading.Thread(target=start_bot_thread, daemon=True)
     bot_thread.start()
     
-    print(f"✅ Telegram bot thread started (PID: {os.getpid()})")
+    print(f"✅ Telegram bot thread started")
     print(f"🌐 Flask API server starting on port {Config.PORT}")
     print(f"📊 Health check: http://0.0.0.0:{Config.PORT}/health")
-    print(f"🛑 Stop bot: http://0.0.0.0:{Config.PORT}/stop_bot?token={Config.ADMIN_ID}")
     print(f"{'='*60}")
     print("📢 Use /start in Telegram bot to begin")
     print(f"{'='*60}")
@@ -3387,6 +3119,5 @@ if __name__ == '__main__':
         host='0.0.0.0',
         port=Config.PORT,
         debug=False,
-        use_reloader=False,  # Important: Disable reloader
-        threaded=True
+        use_reloader=False
     )
