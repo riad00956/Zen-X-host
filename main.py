@@ -23,7 +23,7 @@ db_lock = threading.RLock()
 
 # ১. Configuration
 class Config:
-    TOKEN = os.environ.get('BOT_TOKEN', '8494225623:AAG_HRSHoBpt36bdeUvYJL4ONnh-2bf6BnY')
+    TOKEN = os.environ.get('BOT_TOKEN', '8516043596:AAG4VQVa4ov94w2aXnpybbWLBvE278TEUrs')
     ADMIN_ID = int(os.environ.get('ADMIN_ID', 7832264582))
     PROJECT_DIR = 'projects'
     DB_NAME = 'cyber_v2.db'
