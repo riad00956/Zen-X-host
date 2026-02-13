@@ -3140,8 +3140,6 @@ def calculate_uptime(start_time_str):
     except:
         return "N/A"
 
-def get_process_stats(
-# Continue from where the code was cut off
 def get_process_stats(pid):
     """Get process statistics"""
     try:
@@ -3193,30 +3191,6 @@ def extract_zip_file(zip_path, extract_dir):
     except Exception as e:
         logger.error(f"Error extracting ZIP: {e}")
         return False
-
-def calculate_uptime(start_time_str):
-    """Calculate uptime from start time"""
-    if not start_time_str:
-        return "0s"
-    
-    try:
-        start_time = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S')
-        uptime = datetime.now() - start_time
-        
-        days = uptime.days
-        hours, remainder = divmod(uptime.seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        
-        if days > 0:
-            return f"{days}d {hours}h {minutes}m"
-        elif hours > 0:
-            return f"{hours}h {minutes}m"
-        elif minutes > 0:
-            return f"{minutes}m {seconds}s"
-        else:
-            return f"{seconds}s"
-    except:
-        return "N/A"
 
 def view_database_page(call, page_num):
     """View database page for admin"""
