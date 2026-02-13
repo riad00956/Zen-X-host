@@ -1,4 +1,4 @@
-
+import os
 import subprocess
 import sqlite3
 import telebot
@@ -17,17 +17,6 @@ from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
 from flask import Flask, request, jsonify
 from concurrent.futures import ThreadPoolExecutor
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('zenx_bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
 
 # Database lock for thread safety
 db_lock = threading.RLock()
@@ -52,7 +41,6 @@ class Config:
     BOT_TIMEOUT = 300
     MAX_LOG_SIZE = 10000
     
-    # Updated to 300 capacity nodes
     HOSTING_NODES = [
         {"name": "Node-1", "status": "active", "capacity": 300, "region": "Asia"},
         {"name": "Node-2", "status": "active", "capacity": 300, "region": "Asia"},
